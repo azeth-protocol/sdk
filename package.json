@@ -35,7 +35,8 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "test:mutation": "npx stryker run"
+    "test:mutation": "npx stryker run",
+    "release": "pnpm build && changeset publish"
   },
   "dependencies": {
     "@azeth/common": "^0.1.0",
@@ -50,7 +51,8 @@
     "@stryker-mutator/vitest-runner": "^8.6.0",
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0",
-    "vitest": "^2.1.0"
+    "vitest": "^2.1.0",
+    "@changesets/cli": "^2.27.0"
   },
   "publishConfig": {
     "access": "public"
