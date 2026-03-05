@@ -1,6 +1,6 @@
 {
   "name": "@azeth/sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "TypeScript SDK for the Azeth trust infrastructure — smart accounts, x402 payments, reputation, and service discovery",
   "license": "MIT",
