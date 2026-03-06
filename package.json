@@ -1,6 +1,6 @@
 {
   "name": "@azeth/sdk",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "TypeScript SDK for the Azeth trust infrastructure — smart accounts, x402 payments, reputation, and service discovery",
   "license": "MIT",
@@ -35,11 +35,10 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "test:mutation": "npx stryker run",
-    "release": "pnpm build && changeset publish"
+    "test:mutation": "npx stryker run"
   },
   "dependencies": {
-    "@azeth/common": "^0.2.0",
+    "@azeth/common": "^0.2.1",
     "@x402/core": "^2.4.0",
     "@x402/extensions": "^2.4.0",
     "@xmtp/agent-sdk": "^2.2.0",
@@ -51,8 +50,7 @@
     "@stryker-mutator/vitest-runner": "^8.6.0",
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0",
-    "vitest": "^2.1.0",
-    "@changesets/cli": "^2.27.0"
+    "vitest": "^2.1.0"
   },
   "publishConfig": {
     "access": "public"
