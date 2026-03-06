@@ -234,7 +234,7 @@ export async function createAzethSmartAccountClient(
   }
   // Fallback: use Azeth server bundler proxy (testnet gas sponsorship)
   if (!resolvedBundlerUrl && config.serverUrl) {
-    resolvedBundlerUrl = getServerBundlerUrl(config.serverUrl);
+    resolvedBundlerUrl = getServerBundlerUrl(config.serverUrl, chainId);
   }
   if (!resolvedBundlerUrl) {
     throw new AzethError(
