@@ -6,6 +6,8 @@ import {
   bytesToHex,
   encodeFunctionData,
   getAddress,
+  pad,
+  toHex,
   type PublicClient,
   type WalletClient,
   type Chain,
@@ -36,13 +38,14 @@ import { resolveAddresses, requireAddress } from './utils/addresses.js';
 import { withRetry } from './utils/retry.js';
 import { AzethFactoryAbi, PaymentAgreementModuleAbi, TrustRegistryModuleAbi } from '@azeth/common/abis';
 import { createAccount, getAccountAddress, type CreateAccountParams, type CreateAccountResult } from './account/create.js';
+import { createAccountGasless } from './account/gasless.js';
 import { setTokenWhitelist as setTokenWhitelistFn, setProtocolWhitelist as setProtocolWhitelistFn } from './account/guardian.js';
 import { getBalance, getAllBalances, type BalanceResult } from './account/balance.js';
 import type { AggregatedBalanceResult } from '@azeth/common';
 import { transfer, type TransferParams, type TransferResult } from './account/transfer.js';
 import { getHistory, type HistoryParams, type TransactionRecord } from './account/history.js';
 import { deposit, type DepositParams, type DepositResult } from './account/deposit.js';
-import { registerOnRegistry, updateMetadata, updateMetadataBatch, type RegisterParams, type RegisterResult, type MetadataUpdate } from './registry/register.js';
+import { registerOnRegistry, updateMetadata, updateMetadataBatch, buildAgentURI, type RegisterParams, type RegisterResult, type MetadataUpdate } from './registry/register.js';
 import {
   submitOpinion as submitOnChainOpinion,
   getWeightedReputation as getWeightedRep,
@@ -467,6 +470,41 @@ export class AzethKit {
           endpoint: params.endpoint,
         },
       };
+    }
+
+    // Try gasless creation via relay first (if serverUrl is configured).
+    // The relay pays gas using createAccountWithSignature. Falls back to direct tx
+    // if relay is unavailable (503), rate-limited (429), or any network error occurs.
+    if (this.serverUrl) {
+      // Pre-compute salt and agentURI (same logic as create.ts) so both paths are consistent
+      let salt: `0x${string}`;
+      if (fullParams.salt) {
+        salt = fullParams.salt;
+      } else {
+        const existing = await withRetry(() => this.publicClient.readContract({
+          address: requireAddress(this.addresses, 'factory'),
+          abi: AzethFactoryAbi,
+          functionName: 'getAccountsByOwner',
+          args: [fullParams.owner],
+        })) as readonly `0x${string}`[];
+        salt = pad(toHex(existing.length), { size: 32 });
+      }
+      const agentURI = fullParams.registry ? buildAgentURI(fullParams.registry) : '';
+
+      const gaslessResult = await createAccountGasless(
+        this.publicClient, this.walletClient, this.addresses,
+        fullParams, this.serverUrl, this.chainName, salt, agentURI,
+      );
+      if (gaslessResult) {
+        if (!this._smartAccounts) {
+          this._smartAccounts = [gaslessResult.account];
+        } else {
+          this._smartAccounts.push(gaslessResult.account);
+        }
+        return gaslessResult;
+      }
+      // Relay failed — pass pre-computed salt to avoid duplicate RPC call in fallback
+      fullParams.salt = salt;
     }
 
     const result = await createAccount(this.publicClient, this.walletClient, this.addresses, fullParams);

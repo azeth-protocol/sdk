@@ -10,20 +10,26 @@ npm install @azeth/sdk
 pnpm add @azeth/sdk
 ```
 
-Peer dependency: `viem`.
-
 ## Quick Start
 
 ```typescript
 import { AzethKit } from '@azeth/sdk';
+import { TOKENS } from '@azeth/common';
 
 const kit = await AzethKit.create({
   privateKey: process.env.AZETH_PRIVATE_KEY as `0x${string}`,
   chain: 'baseSepolia',
-  bundlerUrl: `https://api.pimlico.io/v2/84532/rpc?apikey=${process.env.PIMLICO_API_KEY}`,
 });
 
 try {
+  // Deploy a smart account (gas is auto-sponsored, no ETH needed)
+  await kit.createAccount({
+    name: 'MyAgent',
+    entityType: 'agent',
+    description: 'A demo agent',
+    capabilities: ['general'],
+  });
+
   // Check balances across all accounts with USD values
   const balances = await kit.getAllBalances();
   console.log('Total:', balances.grandTotalUSDFormatted);
@@ -32,7 +38,7 @@ try {
   await kit.transfer({
     to: '0xRecipient...' as `0x${string}`,
     amount: 1_000_000n, // 1 USDC
-    token: '0xUSDC...' as `0x${string}`,
+    token: TOKENS.baseSepolia.USDC,
   });
 
   // Pay for an x402 service
@@ -46,6 +52,8 @@ try {
   await kit.destroy();
 }
 ```
+
+Only `privateKey` and `chain` are required. Gas sponsorship, bundler, and server URL are handled automatically via the Azeth server at `api.azeth.ai`. For production or custom infrastructure, see [Configuration](#configuration) below.
 
 ## Key Features
 
@@ -128,6 +136,33 @@ try {
     console.error(err.code, err.message);
   }
 }
+```
+
+## Configuration
+
+The minimal config is just `privateKey` + `chain`. Everything else has smart defaults:
+
+```typescript
+const kit = await AzethKit.create({
+  privateKey: '0x...',              // Required
+  chain: 'baseSepolia',             // Required
+  // All below are optional:
+  serverUrl: 'https://api.azeth.ai', // Default — handles gasless relay + bundler proxy
+  bundlerUrl: undefined,             // Falls back to server bundler proxy
+  paymasterUrl: undefined,           // Falls back to server paymaster
+  rpcUrl: undefined,                 // Falls back to public RPC for the chain
+});
+```
+
+For production with your own infrastructure:
+
+```typescript
+const kit = await AzethKit.create({
+  privateKey: '0x...',
+  chain: 'base',
+  bundlerUrl: `https://api.pimlico.io/v2/8453/rpc?apikey=${PIMLICO_KEY}`,
+  paymasterUrl: `https://api.pimlico.io/v2/8453/rpc?apikey=${PIMLICO_KEY}`,
+});
 ```
 
 ## Full Documentation
