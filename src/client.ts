@@ -415,6 +415,35 @@ export class AzethKit {
     return accounts[0];
   }
 
+  /** Set the active smart account for subsequent operations (payments, transfers, etc.).
+   *  Reorders the internal accounts array so the specified address becomes the default.
+   *  All methods that use `resolveSmartAccount()` or `_smartAccounts[0]` will use it.
+   *
+   *  @param address - Address of one of your smart accounts (must already be in the accounts list)
+   *  @throws AzethError if no accounts are loaded or the address is not found
+   */
+  setActiveAccount(address: `0x${string}`): void {
+    if (!this._smartAccounts || this._smartAccounts.length === 0) {
+      throw new AzethError(
+        'No smart accounts loaded. Call getSmartAccounts() first.',
+        'ACCOUNT_NOT_FOUND',
+      );
+    }
+    const normalized = getAddress(address);
+    const idx = this._smartAccounts.findIndex(a => getAddress(a) === normalized);
+    if (idx === -1) {
+      throw new AzethError(
+        `Address ${address} is not one of your smart accounts.`,
+        'ACCOUNT_NOT_FOUND',
+        { address },
+      );
+    }
+    if (idx > 0) {
+      const [target] = this._smartAccounts.splice(idx, 1);
+      this._smartAccounts.unshift(target!);
+    }
+  }
+
   /** Deploy a new Azeth smart account via the AzethFactory v11 (one-call setup).
    *
    *  Single atomic transaction: deploys ERC-1967 proxy, installs all 4 modules,
