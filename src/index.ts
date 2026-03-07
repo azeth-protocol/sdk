@@ -1,6 +1,6 @@
 // @azeth/sdk — Trust Infrastructure for the Machine Economy
 
-export { AzethKit, type AzethKitConfig } from './client.js';
+export { AzethKit, type AzethKitConfig, type SimpleCreateAccountParams, type SimpleOpinion, type PayResult } from './client.js';
 
 // Account operations
 export { type CreateAccountParams, type CreateAccountResult } from './account/create.js';

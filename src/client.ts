@@ -34,7 +34,7 @@ import {
 import { validateAddress, validateUrl, validatePositiveAmount } from './utils/validation.js';
 import { resolveAddresses, requireAddress } from './utils/addresses.js';
 import { withRetry } from './utils/retry.js';
-import { AzethFactoryAbi, PaymentAgreementModuleAbi } from '@azeth/common/abis';
+import { AzethFactoryAbi, PaymentAgreementModuleAbi, TrustRegistryModuleAbi } from '@azeth/common/abis';
 import { createAccount, getAccountAddress, type CreateAccountParams, type CreateAccountResult } from './account/create.js';
 import { setTokenWhitelist as setTokenWhitelistFn, setProtocolWhitelist as setProtocolWhitelistFn } from './account/guardian.js';
 import { getBalance, getAllBalances, type BalanceResult } from './account/balance.js';
@@ -101,6 +101,63 @@ export interface AzethKitConfig {
    *  to every UserOperation, enabling operations that exceed standard spending limits.
    *  Must be explicitly set to `true` — defaults to `false` (guardian must confirm via XMTP). */
   guardianAutoSign?: boolean;
+}
+
+/** Simplified account creation — auto-fills owner, guardrails, and wraps into registry.
+ *  Use this when you want sensible defaults without manual guardrail configuration. */
+export interface SimpleCreateAccountParams {
+  /** Display name for the trust registry entry */
+  name: string;
+  /** Entity type: 'agent', 'service', or 'infrastructure' */
+  entityType: 'agent' | 'service' | 'infrastructure';
+  /** Human-readable description */
+  description: string;
+  /** Service capabilities for discovery (e.g., ['weather-data', 'price-feed']) */
+  capabilities?: string[];
+  /** Service endpoint URL */
+  endpoint?: string;
+  /** Max per-transaction amount in USD (default: 100) */
+  maxTxAmountUSD?: number;
+  /** Daily spending limit in USD (default: 1000) */
+  dailySpendLimitUSD?: number;
+  /** Guardian address for co-signing high-value txs (default: self-guardian) */
+  guardian?: `0x${string}`;
+  /** Emergency withdrawal destination (default: owner) */
+  emergencyWithdrawTo?: `0x${string}`;
+}
+
+/** Simplified opinion — rating from -100 to 100, auto-converts to WAD format */
+export interface SimpleOpinion {
+  /** Target service's ERC-8004 token ID */
+  serviceTokenId: bigint;
+  /** Rating from -100 to 100 (supports decimals like 85.5) */
+  rating: number;
+  /** Primary categorization tag (default: 'quality') */
+  tag1?: string;
+  /** Secondary categorization tag (default: '') */
+  tag2?: string;
+  /** Service endpoint being rated */
+  endpoint?: string;
+}
+
+/** Result from pay() — fetch402 result with auto-parsed response body */
+export interface PayResult {
+  /** Parsed response body (JSON object or raw text string) */
+  data: unknown;
+  /** Raw HTTP response (body already consumed) */
+  response: Response;
+  /** Whether an x402 payment was made */
+  paymentMade: boolean;
+  /** Payment amount in token base units (e.g., USDC with 6 decimals) */
+  amount?: bigint;
+  /** On-chain transaction hash of the payment */
+  txHash?: `0x${string}`;
+  /** Response time in milliseconds */
+  responseTimeMs?: number;
+  /** Whether on-chain settlement was verified */
+  settlementVerified: boolean;
+  /** How access was obtained */
+  paymentMethod: 'x402' | 'smart-account' | 'session' | 'none';
 }
 
 /** AzethKit -- Trust Infrastructure SDK for the Machine Economy
@@ -359,10 +416,60 @@ export class AzethKit {
    *
    *  Single atomic transaction: deploys ERC-1967 proxy, installs all 4 modules,
    *  registers on ERC-8004 trust registry (optional), and permanently revokes factory access.
+   *
+   *  Accepts either full params (CreateAccountParams) or simplified params
+   *  (SimpleCreateAccountParams) that auto-fill owner, guardrails, and registry.
+   *
+   *  @example Simplified (recommended for most cases):
+   *  ```typescript
+   *  await agent.createAccount({
+   *    name: 'WeatherOracle',
+   *    entityType: 'service',
+   *    description: 'Real-time weather data',
+   *    capabilities: ['weather-data'],
+   *    endpoint: 'http://localhost:3402',
+   *  });
+   *  ```
+   *
+   *  @example Full control:
+   *  ```typescript
+   *  await agent.createAccount({
+   *    owner: agent.address,
+   *    guardrails: { maxTxAmountUSD: 500n * 10n**18n, ... },
+   *    registry: { name: 'WeatherOracle', entityType: 'service', ... },
+   *  });
+   *  ```
    */
-  async createAccount(params: CreateAccountParams): Promise<CreateAccountResult> {
+  async createAccount(params: CreateAccountParams | SimpleCreateAccountParams): Promise<CreateAccountResult> {
     this._requireNotDestroyed();
-    const result = await createAccount(this.publicClient, this.walletClient, this.addresses, params);
+
+    let fullParams: CreateAccountParams;
+    if ('owner' in params) {
+      fullParams = params;
+    } else {
+      const maxTx = params.maxTxAmountUSD ?? 100;
+      const dailyLimit = params.dailySpendLimitUSD ?? 1000;
+      fullParams = {
+        owner: this.address,
+        guardrails: {
+          maxTxAmountUSD: BigInt(Math.round(maxTx)) * 10n ** 18n,
+          dailySpendLimitUSD: BigInt(Math.round(dailyLimit)) * 10n ** 18n,
+          guardianMaxTxAmountUSD: BigInt(Math.round(maxTx * 5)) * 10n ** 18n,
+          guardianDailySpendLimitUSD: BigInt(Math.round(dailyLimit * 5)) * 10n ** 18n,
+          guardian: params.guardian ?? this.address,
+          emergencyWithdrawTo: params.emergencyWithdrawTo ?? this.address,
+        },
+        registry: {
+          name: params.name,
+          description: params.description,
+          entityType: params.entityType,
+          capabilities: params.capabilities ?? [],
+          endpoint: params.endpoint,
+        },
+      };
+    }
+
+    const result = await createAccount(this.publicClient, this.walletClient, this.addresses, fullParams);
     // Cache the newly created account
     if (!this._smartAccounts) {
       this._smartAccounts = [result.account];
@@ -853,15 +960,83 @@ export class AzethKit {
     }
   }
 
+  /** Pay for an x402-gated service and return parsed response data.
+   *
+   *  Convenience wrapper around fetch402 that auto-parses the response body.
+   *  Returns JSON objects for JSON responses, raw text for others.
+   *
+   *  @param url - Service URL to fetch and pay for
+   *  @param options - Fetch options (method, body, maxAmount, etc.)
+   *  @returns PayResult with parsed `data` field
+   *
+   *  @example
+   *  ```typescript
+   *  const result = await agent.pay('https://api.example.com/data');
+   *  console.log(result.data); // parsed JSON response
+   *  ```
+   */
+  async pay(url: string, options?: Fetch402Options): Promise<PayResult> {
+    const result = await this.fetch402(url, options);
+    const text = await result.response.text();
+    let data: unknown;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = text;
+    }
+    return { ...result, data };
+  }
+
   // ──────────────────────────────────────────────
   // Trust registry
   // ──────────────────────────────────────────────
 
-  /** Register this account on the ERC-8004 trust registry */
+  /** Register on the ERC-8004 trust registry, or update metadata if already registered.
+   *
+   *  If the smart account is already registered (e.g., via createAccount with registry params),
+   *  this method gracefully falls back to updating the metadata fields instead of reverting.
+   */
   async publishService(params: RegisterParams): Promise<RegisterResult> {
     this._requireNotDestroyed();
     const account = await this.resolveSmartAccount();
     const smartAccountClient = await this._getSmartAccountClient(account);
+
+    // Check if already registered to avoid AlreadyRegistered revert
+    const moduleAddress = this.addresses.trustRegistryModule;
+    if (moduleAddress) {
+      let isRegistered = false;
+      try {
+        isRegistered = await this.publicClient.readContract({
+          address: moduleAddress,
+          abi: TrustRegistryModuleAbi,
+          functionName: 'isRegistered',
+          args: [account],
+        }) as boolean;
+      } catch {
+        // If check fails, proceed with registration attempt
+      }
+
+      if (isRegistered) {
+        // Already registered — update metadata instead
+        const updates: MetadataUpdate[] = [];
+        if (params.name) updates.push({ key: 'name', value: params.name });
+        if (params.description) updates.push({ key: 'description', value: params.description });
+        if (params.capabilities.length > 0) {
+          updates.push({ key: 'capabilities', value: JSON.stringify(params.capabilities) });
+        }
+        if (params.endpoint) updates.push({ key: 'endpoint', value: params.endpoint });
+
+        let txHash = '0x' as `0x${string}`;
+        if (updates.length > 0) {
+          txHash = await updateMetadataBatch(
+            this.publicClient, smartAccountClient, this.addresses, this.address, updates,
+          );
+        }
+
+        return { tokenId: 0n, txHash };
+      }
+    }
+
     return registerOnRegistry(
       this.publicClient, smartAccountClient, this.addresses, this.address, params,
     );
@@ -1050,15 +1225,55 @@ export class AzethKit {
 
   /** Submit a reputation opinion for an agent via the ReputationModule.
    *
-   *  Requires a positive net USD payment from this account to the target agent
-   *  (aggregated on-chain via Chainlink). Value is int128 with configurable decimal precision.
+   *  Accepts either full OnChainOpinion params or simplified SimpleOpinion with a rating.
+   *  Requires a positive net USD payment from this account to the target agent.
+   *
+   *  @example Simplified:
+   *  ```typescript
+   *  await agent.submitOpinion({
+   *    serviceTokenId: service.tokenId,
+   *    rating: 85,        // -100 to 100
+   *    tag1: 'quality',   // optional
+   *  });
+   *  ```
+   *
+   *  @example Full control:
+   *  ```typescript
+   *  await agent.submitOpinion({
+   *    agentId: 1024n,
+   *    value: 85n * 10n**18n,
+   *    valueDecimals: 18,
+   *    tag1: 'quality', tag2: 'x402',
+   *    endpoint: 'https://...', opinionURI: '', opinionHash: '0x...',
+   *  });
+   *  ```
    */
-  async submitOpinion(opinion: OnChainOpinion): Promise<`0x${string}`> {
+  async submitOpinion(opinion: OnChainOpinion | SimpleOpinion): Promise<`0x${string}`> {
     this._requireNotDestroyed();
+
+    let fullOpinion: OnChainOpinion;
+    if ('agentId' in opinion) {
+      fullOpinion = opinion;
+    } else {
+      if (opinion.rating < -100 || opinion.rating > 100) {
+        throw new AzethError('Rating must be between -100 and 100', 'INVALID_INPUT', { field: 'rating' });
+      }
+      fullOpinion = {
+        agentId: opinion.serviceTokenId,
+        value: BigInt(Math.round(opinion.rating * 1e18)),
+        valueDecimals: 18,
+        tag1: opinion.tag1 ?? 'quality',
+        tag2: opinion.tag2 ?? '',
+        endpoint: opinion.endpoint ?? '',
+        opinionURI: '',
+        opinionHash: '0x0000000000000000000000000000000000000000000000000000000000000000' as `0x${string}`,
+      };
+    }
+
     const account = await this.resolveSmartAccount();
     const smartAccountClient = await this._getSmartAccountClient(account);
     return submitOnChainOpinion(
-      this.publicClient, smartAccountClient, this.addresses, this.address, opinion,
+      this.publicClient, smartAccountClient, this.addresses, this.address, fullOpinion,
     );
   }
 
