@@ -798,9 +798,12 @@ export class AzethKit {
       // Routes x402 payments through PaymentAgreementModule.pay() to capture
       // protocol fees on-chain. The module validates the transferWithAuth calldata,
       // checks guardian spending limits, executes the payment, and adds the fee.
+      // Accept serverUrl as a bundler source — the server proxies bundler requests
+      // via its own Pimlico key, so MCP users don't need AZETH_BUNDLER_URL.
       let smartAccountTransfer: SmartAccountTransferCallback | undefined;
       const payModuleAddr = this.addresses.paymentAgreementModule;
-      if (smartAccount && this._bundlerUrl && payModuleAddr) {
+      const hasBundler = !!(this._bundlerUrl || this.serverUrl);
+      if (smartAccount && hasBundler && payModuleAddr) {
         smartAccountTransfer = async (params) => {
           const sac = await this._getSmartAccountClient(smartAccount);
           const payData = encodeFunctionData({
@@ -919,7 +922,8 @@ export class AzethKit {
       // Build smartAccountTransfer callback — routes through pay() for fee capture
       let smartAccountTransfer: SmartAccountTransferCallback | undefined;
       const payModuleAddr2 = this.addresses.paymentAgreementModule;
-      if (smartAccount && this._bundlerUrl && payModuleAddr2) {
+      const hasBundler2 = !!(this._bundlerUrl || this.serverUrl);
+      if (smartAccount && hasBundler2 && payModuleAddr2) {
         smartAccountTransfer = async (params) => {
           const sac = await this._getSmartAccountClient(smartAccount);
           const payData = encodeFunctionData({
