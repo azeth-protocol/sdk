@@ -16,6 +16,7 @@ import {
   entryPoint07Abi,
   entryPoint07Address,
   getUserOperationHash,
+  prepareUserOperation,
 } from 'viem/account-abstraction';
 import { createSmartAccountClient, type SmartAccountClient as PermissionlessSmartAccountClient } from 'permissionless';
 import { AzethAccountAbi } from '@azeth/common/abis';
@@ -195,6 +196,30 @@ export async function createAzethSmartAccount(
 }
 
 /**
+ * Multiplier (numerator / denominator) applied to the bundler's estimated
+ * `verificationGasLimit`.
+ *
+ * GuardianModule.validateUserOp burns a STATE-DEPENDENT amount of verification
+ * gas: oracle staticcalls, a daily-spend SSTORE (cold ~20k / warm ~5k), and a
+ * conditional epoch reset. The bundler estimates against on-chain state at
+ * estimation time, but that slot can be cold (or the epoch can roll over) by
+ * execution time, so the real verification cost can exceed a tight point
+ * estimate — deterministically reverting with `AA26 over verificationGasLimit`.
+ * A 1.5x buffer absorbs that variance; unused gas is refunded by the EntryPoint,
+ * so over-provisioning is safe. This restores the headroom lost when the flat
+ * 300K override was removed alongside the v22 GuardianModule estimation fix, but
+ * as a proportional multiplier rather than a magic constant.
+ */
+const VERIFICATION_GAS_BUFFER_NUMERATOR = 3n;
+const VERIFICATION_GAS_BUFFER_DENOMINATOR = 2n;
+
+/** Apply the verification-gas safety buffer to a bundler estimate.
+ *  See {@link VERIFICATION_GAS_BUFFER_NUMERATOR} for why this is needed. */
+export function applyVerificationGasBuffer(verificationGasLimit: bigint): bigint {
+  return (verificationGasLimit * VERIFICATION_GAS_BUFFER_NUMERATOR) / VERIFICATION_GAS_BUFFER_DENOMINATOR;
+}
+
+/**
  * Create a permissionless SmartAccountClient for an AzethAccount.
  *
  * The SmartAccountClient handles the full ERC-4337 flow:
@@ -273,6 +298,20 @@ export async function createAzethSmartAccountClient(
     chain: publicClient.chain,
     bundlerTransport: http(resolvedBundlerUrl),
     client: publicClient,
+    // Absorb state-dependent GuardianModule verification-gas variance (see
+    // applyVerificationGasBuffer). Wrapping prepareUserOperation applies the
+    // buffer to EVERY UserOp submitted through this client — value transfers,
+    // agreement executions, x402 settlement — so a cold daily-spend slot can't
+    // deterministically AA26 a funded account's first value-spend.
+    userOperation: {
+      prepareUserOperation: async (client, parameters) => {
+        const prepared = await prepareUserOperation(client, parameters);
+        return {
+          ...prepared,
+          verificationGasLimit: applyVerificationGasBuffer(prepared.verificationGasLimit),
+        };
+      },
+    },
   };
 
   // Wire paymaster middleware when URL is available.

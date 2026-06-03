@@ -180,7 +180,23 @@ describe('payments/x402', () => {
         fetch402(publicClient, walletClient, TEST_ACCOUNT, testUrl, {
           maxAmount: 500000n, // 0.5 USDC, less than the 1 USDC required
         }),
-      ).rejects.toThrow('Payment of 1 USDC exceeds maximum of 0.50 USDC');
+      ).rejects.toThrow('Payment of 1 USDC exceeds maximum of 0.5 USDC');
+    });
+
+    it('shows sub-cent maxAmount at full precision in the error (F-8)', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(
+        createMockResponse(402, null, {
+          'X-Payment-Required': JSON.stringify(paymentRequirement),
+        }),
+      );
+
+      // 0.009 USDC used to round to "0.01" (self-contradictory: "0.01 exceeds 0.01"),
+      // and 0.001 USDC rounded to "0". Full precision shows the real cap.
+      await expect(
+        fetch402(publicClient, walletClient, TEST_ACCOUNT, testUrl, {
+          maxAmount: 9000n, // 0.009 USDC
+        }),
+      ).rejects.toThrow('Payment of 1 USDC exceeds maximum of 0.009 USDC');
     });
 
     it('should not throw when payment is within maxAmount budget', async () => {
@@ -595,7 +611,8 @@ describe('payments/x402', () => {
           smartAccountTransfer: mockSmartAccountTransfer,
           maxAmount: 500000n, // 0.5 USDC, less than the 1 USDC required
         }),
-      ).rejects.toThrow('Payment of 1 USDC exceeds maximum of 0.50 USDC');
+      ).rejects.toThrow('Payment of 1 USDC exceeds maximum of 0.5 USDC');
     });
+
   });
 });

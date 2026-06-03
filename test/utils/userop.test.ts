@@ -6,6 +6,7 @@ const {
   mockToSmartAccount,
   mockGetPaymasterData,
   mockGetPaymasterStubData,
+  mockPrepareUserOperation,
 } = vi.hoisted(() => ({
   mockCreateSmartAccountClient: vi.fn().mockReturnValue({
     sendTransaction: vi.fn(),
@@ -19,6 +20,7 @@ const {
   }),
   mockGetPaymasterData: vi.fn().mockResolvedValue({ paymaster: '0xPaymaster', paymasterData: '0xdata' }),
   mockGetPaymasterStubData: vi.fn().mockResolvedValue({ paymaster: '0xPaymaster', paymasterData: '0xstubdata' }),
+  mockPrepareUserOperation: vi.fn(),
 }));
 
 vi.mock('permissionless', () => ({
@@ -30,6 +32,7 @@ vi.mock('viem/account-abstraction', () => ({
   entryPoint07Abi: [],
   entryPoint07Address: '0x0000000071727De22E5E9d8BAf0edAc6f37da032',
   getUserOperationHash: vi.fn().mockReturnValue('0x' + '00'.repeat(32)),
+  prepareUserOperation: mockPrepareUserOperation,
 }));
 
 vi.mock('viem', async (importOriginal) => {
@@ -53,7 +56,7 @@ vi.mock('@azeth/common/abis', () => ({
   AzethAccountAbi: [],
 }));
 
-import { createAzethSmartAccountClient } from '../../src/utils/userop.js';
+import { createAzethSmartAccountClient, applyVerificationGasBuffer } from '../../src/utils/userop.js';
 import type { PublicClient, WalletClient, Transport, Chain, Account } from 'viem';
 
 function mockPublicClient(overrides: Record<string, unknown> = {}): PublicClient<Transport, Chain> {
@@ -211,5 +214,64 @@ describe('createAzethSmartAccountClient', () => {
         // No bundlerUrl, no env vars, no matching chain
       }),
     ).rejects.toThrow('bundlerUrl is required');
+  });
+
+  // F-2: native value-spends deterministically AA26'd because the SDK took the
+  // bundler's verificationGasLimit estimate verbatim, leaving no headroom for
+  // GuardianModule's state-dependent validation gas (cold daily-spend SSTORE,
+  // epoch reset). The client must install a prepareUserOperation hook that
+  // buffers verificationGasLimit for EVERY UserOp.
+  it('installs a prepareUserOperation hook that buffers verificationGasLimit (F-2)', async () => {
+    mockPrepareUserOperation.mockResolvedValue({
+      sender: TEST_SMART_ACCOUNT,
+      nonce: 1n,
+      callData: '0x',
+      callGasLimit: 50_000n,
+      verificationGasLimit: 100_000n,
+      preVerificationGas: 40_000n,
+      maxFeePerGas: 1n,
+      maxPriorityFeePerGas: 1n,
+      signature: '0x',
+    });
+
+    await createAzethSmartAccountClient({
+      publicClient: mockPublicClient(),
+      walletClient: mockWalletClient(),
+      smartAccountAddress: TEST_SMART_ACCOUNT,
+      bundlerUrl: TEST_BUNDLER_URL,
+    });
+
+    const callArgs = mockCreateSmartAccountClient.mock.calls[0][0];
+    expect(callArgs.userOperation).toBeDefined();
+    expect(callArgs.userOperation.prepareUserOperation).toBeTypeOf('function');
+
+    // Invoke the installed hook: it must delegate to viem's prepareUserOperation
+    // and return the SAME op with only verificationGasLimit scaled up 1.5x.
+    const fakeClient = {} as never;
+    const fakeParams = {} as never;
+    const prepared = await callArgs.userOperation.prepareUserOperation(fakeClient, fakeParams);
+
+    expect(mockPrepareUserOperation).toHaveBeenCalledWith(fakeClient, fakeParams);
+    expect(prepared.verificationGasLimit).toBe(150_000n); // 100k * 3/2
+    // Every other field passes through untouched.
+    expect(prepared.callGasLimit).toBe(50_000n);
+    expect(prepared.preVerificationGas).toBe(40_000n);
+    expect(prepared.nonce).toBe(1n);
+  });
+});
+
+describe('applyVerificationGasBuffer', () => {
+  it('scales the estimate by 1.5x (the AA26 fix for F-2)', () => {
+    // The exact verificationGasLimit (101136) the bundler returned for the
+    // transfer that deterministically reverted with AA26 in the MCP test.
+    expect(applyVerificationGasBuffer(101_136n)).toBe(151_704n);
+    expect(applyVerificationGasBuffer(100_000n)).toBe(150_000n);
+    expect(applyVerificationGasBuffer(0n)).toBe(0n);
+  });
+
+  it('always returns at least the input (headroom is never negative)', () => {
+    for (const estimate of [1n, 12_345n, 80_000n, 101_136n, 500_000n]) {
+      expect(applyVerificationGasBuffer(estimate)).toBeGreaterThanOrEqual(estimate);
+    }
   });
 });

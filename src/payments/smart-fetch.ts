@@ -101,7 +101,9 @@ export async function smartFetch402(
   const resolvedChain = chainName ?? chainIdToName(publicClient.chain?.id ?? 0) ?? 'baseSepolia' as SupportedChainName;
   const discoveryResult = await discoverServicesWithFallback(serverUrl, discoveryParams, publicClient, resolvedChain);
   const services = discoveryResult.entries
-    .filter(s => !!s.endpoint)
+    // Reject empty AND whitespace-only endpoints — registry entries with " "
+    // are truthy but produce `fetch(" ")` → "Invalid URL", aborting the fallback (S-3).
+    .filter(s => !!s.endpoint?.trim())
     .slice(0, maxRetries);
 
   if (services.length === 0) {
@@ -126,8 +128,8 @@ export async function smartFetch402(
   for (let i = 0; i < services.length; i++) {
     const service = services[i]!;
 
-    // Skip services without an endpoint
-    if (!service.endpoint) {
+    // Skip services without a usable endpoint (empty or whitespace-only)
+    if (!service.endpoint?.trim()) {
       failedServices.push({ service, error: 'No endpoint URL' });
       continue;
     }

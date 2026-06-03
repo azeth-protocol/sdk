@@ -24,6 +24,19 @@ export interface TransactionRecord {
   timestamp: number;
 }
 
+/** Shape of a single record returned by the server's GET /api/v1/history.
+ *  The server wraps records in `{ data, meta }` and serializes the bigint
+ *  fields (value, blockNumber) as JSON-safe strings. */
+interface ServerHistoryRecord {
+  hash: `0x${string}`;
+  from: `0x${string}`;
+  to: `0x${string}` | null;
+  value: string;
+  token: `0x${string}` | null;
+  blockNumber: string;
+  timestamp: number;
+}
+
 /** Pad an address to a 32-byte hex topic for event log filtering */
 function addressToTopic(addr: `0x${string}`): `0x${string}` {
   return `0x000000000000000000000000${addr.slice(2).toLowerCase()}` as `0x${string}`;
@@ -51,7 +64,20 @@ export async function getHistory(
     try {
       const response = await withRetry(() => fetch(`${serverUrl}/api/v1/history?${queryParams}`));
       if (response.ok) {
-        return await response.json() as TransactionRecord[];
+        // The server returns { data, meta } (not a bare array) and serializes
+        // bigint fields as strings. Unwrap the envelope and restore the bigint
+        // types declared by TransactionRecord so callers (e.g. the MCP tool's
+        // formatTokenAmount) receive the contract they expect.
+        const body = await response.json() as { data?: ServerHistoryRecord[] };
+        return (body.data ?? []).map((r) => ({
+          hash: r.hash,
+          from: r.from,
+          to: r.to,
+          value: BigInt(r.value),
+          token: r.token,
+          blockNumber: BigInt(r.blockNumber),
+          timestamp: r.timestamp,
+        }));
       }
       // Non-OK response — fall through to on-chain fallback
     } catch {

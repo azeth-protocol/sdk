@@ -311,8 +311,8 @@ export async function fetch402(
   // Check budget (default cap: 10 USDC if not specified)
   const effectiveMaxAmount = options?.maxAmount ?? DEFAULT_MAX_AMOUNT;
   if (amount > effectiveMaxAmount) {
-    const requiredFmt = formatTokenAmount(amount, 6, 2);
-    const maxFmt = formatTokenAmount(effectiveMaxAmount, 6, 2);
+    const requiredFmt = formatTokenAmount(amount, 6);
+    const maxFmt = formatTokenAmount(effectiveMaxAmount, 6);
     throw new AzethError(
       `Payment of ${requiredFmt} USDC exceeds maximum of ${maxFmt} USDC`,
       'BUDGET_EXCEEDED',
@@ -683,8 +683,8 @@ async function attemptSmartAccountPayment(
     // Budget check
     const effectiveMaxAmount = options.maxAmount ?? DEFAULT_MAX_AMOUNT;
     if (amount > effectiveMaxAmount) {
-      const requiredFmt = formatTokenAmount(amount, 6, 2);
-      const maxFmt = formatTokenAmount(effectiveMaxAmount, 6, 2);
+      const requiredFmt = formatTokenAmount(amount, 6);
+      const maxFmt = formatTokenAmount(effectiveMaxAmount, 6);
       throw new AzethError(
         `Payment of ${requiredFmt} USDC exceeds maximum of ${maxFmt} USDC`,
         'BUDGET_EXCEEDED',

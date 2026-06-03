@@ -202,6 +202,29 @@ describe('smartFetch402 (standalone routing layer)', () => {
     expect(result.failedServices).toBeUndefined();
   });
 
+  it('should filter out whitespace-only endpoints before attempting (S-3)', async () => {
+    const spaceEndpoint = makeService({ tokenId: 1n, name: 'SpaceEndpoint', endpoint: ' ' });
+    const blankEndpoint = makeService({ tokenId: 2n, name: 'BlankEndpoint', endpoint: '   ' });
+    const withEndpoint = makeService({ tokenId: 3n, name: 'HasEndpoint', endpoint: 'https://good.example.com' });
+    mockedDiscover.mockResolvedValueOnce({ entries: [spaceEndpoint, blankEndpoint, withEndpoint], source: 'server' });
+    mockedFetch402.mockResolvedValueOnce(makeFetch402Result());
+
+    const result = await smartFetch402(
+      publicClient as any, walletClient as any, TEST_OWNER, SERVER_URL,
+      'price-feed',
+    );
+
+    // The whitespace endpoints are truthy but would make fetch(" ") throw "Invalid
+    // URL"; they must be skipped so the valid service is the one attempted.
+    expect(result.service.name).toBe('HasEndpoint');
+    expect(result.attemptsCount).toBe(1);
+    expect(mockedFetch402).toHaveBeenCalledTimes(1);
+    expect(mockedFetch402).toHaveBeenCalledWith(
+      expect.anything(), expect.anything(), TEST_OWNER, 'https://good.example.com',
+      expect.anything(),
+    );
+  });
+
   it('should move preferredService to the front', async () => {
     const service1 = makeService({ tokenId: 1n, name: 'First', reputation: 95 });
     const service2 = makeService({ tokenId: 2n, name: 'Preferred', reputation: 80, endpoint: 'https://preferred.example.com' });

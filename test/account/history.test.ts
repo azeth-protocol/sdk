@@ -16,25 +16,47 @@ describe('account/history', () => {
   });
 
   describe('server-based history (with serverUrl)', () => {
-    it('should fetch history from the server API', async () => {
-      const mockRecords = [
-        {
-          hash: '0xabc' as `0x${string}`,
-          from: TEST_ACCOUNT,
-          to: '0x1234' as `0x${string}`,
-          value: 100n,
-          blockNumber: 50n,
-          timestamp: 1700000000,
-        },
-      ];
+    it('parses the { data, meta } envelope and restores bigint fields (F-5)', async () => {
+      // The real server wraps records in { data, meta } and serializes the
+      // bigint fields (value, blockNumber) as JSON strings. The SDK previously
+      // cast the whole body to TransactionRecord[], so it returned the wrapper
+      // object instead of the records (and string-typed values).
+      const serverBody = {
+        data: [
+          {
+            hash: '0xabc' as `0x${string}`,
+            from: TEST_ACCOUNT,
+            to: '0x1234' as `0x${string}`,
+            value: '100',
+            token: null,
+            type: 'transfer',
+            timestamp: 1700000000,
+            blockNumber: '50',
+          },
+        ],
+        meta: { count: 1, nextCursor: undefined },
+      };
 
       globalThis.fetch = vi.fn().mockResolvedValue(
-        createMockResponse(200, mockRecords),
+        createMockResponse(200, serverBody),
       );
 
       const result = await getHistory(publicClient, TEST_ACCOUNT, 'https://api.azeth.ai');
 
-      expect(result).toEqual(mockRecords);
+      expect(result).toEqual([
+        {
+          hash: '0xabc',
+          from: TEST_ACCOUNT,
+          to: '0x1234',
+          value: 100n,
+          token: null,
+          blockNumber: 50n,
+          timestamp: 1700000000,
+        },
+      ]);
+      // bigint fields restored from JSON strings
+      expect(result[0]?.value).toBe(100n);
+      expect(result[0]?.blockNumber).toBe(50n);
       expect(globalThis.fetch).toHaveBeenCalledWith(
         expect.stringContaining('https://api.azeth.ai/api/v1/history'),
       );
