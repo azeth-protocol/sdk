@@ -64,7 +64,7 @@ export class XMTPClient implements MessagingClient {
           id: string;
           createdAt: Date;
           peerInboxId: string;
-          messages: (opts?: { limit?: number }) => Promise<Array<{
+          messages: (opts?: { limit?: number; direction?: number }) => Promise<Array<{
             content: unknown;
             senderInboxId: string;
             sentAtNs: bigint;
@@ -348,12 +348,18 @@ export class XMTPClient implements MessagingClient {
       const conv = conversations.find(c => c.id === conversationId);
       if (!conv) return [];
 
-      // Fetch more than requested to compensate for filtered internal messages
-      const rawMessages = await conv.messages({ limit: clampedLimit + 10 });
+      // Fetch newest-first and over-fetch to compensate for filtered internal
+      // messages. `direction: 1` is SortDirection.Descending — XMTP defaults to
+      // ascending (oldest-first), which made limit=1 return the OLDEST message and
+      // the inbox "latestMessage" show the oldest one (F-10).
+      const rawMessages = await conv.messages({ limit: clampedLimit + 10, direction: 1 });
 
-      // Filter out XMTP internal messages (group membership events, etc.)
-      // Only include messages with string content (actual user text).
-      const textMessages = rawMessages.filter(msg => typeof msg.content === 'string');
+      // Filter out XMTP internal messages (group membership events, etc.) — only
+      // user text — then sort newest-first (defensive: guarantees order regardless
+      // of how the bindings window `limit`).
+      const textMessages = rawMessages
+        .filter(msg => typeof msg.content === 'string')
+        .sort((a, b) => (a.sentAtNs > b.sentAtNs ? -1 : a.sentAtNs < b.sentAtNs ? 1 : 0));
 
       // Batch-resolve sender inbox IDs to Ethereum addresses
       const uniqueSenders = [...new Set(

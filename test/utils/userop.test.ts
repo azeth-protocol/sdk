@@ -6,13 +6,20 @@ const {
   mockToSmartAccount,
   mockGetPaymasterData,
   mockGetPaymasterStubData,
-  mockPrepareUserOperation,
+  mockEstimateUserOperationGas,
 } = vi.hoisted(() => ({
-  mockCreateSmartAccountClient: vi.fn().mockReturnValue({
-    sendTransaction: vi.fn(),
-    account: { address: '0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD' },
-    chain: { id: 84532 },
-    paymaster: undefined,
+  // Returns a fresh client per call with a minimal viem-style `.extend` that
+  // applies the decorator's actions onto the client (so the estimateUserOperationGas
+  // override installed by createAzethSmartAccountClient is observable).
+  mockCreateSmartAccountClient: vi.fn().mockImplementation(() => {
+    const base: Record<string, unknown> = {
+      sendTransaction: vi.fn(),
+      account: { address: '0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD' },
+      chain: { id: 84532 },
+      paymaster: undefined,
+    };
+    base['extend'] = (fn: (c: Record<string, unknown>) => Record<string, unknown>) => Object.assign(base, fn(base));
+    return base;
   }),
   mockToSmartAccount: vi.fn().mockResolvedValue({
     address: '0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD',
@@ -20,7 +27,7 @@ const {
   }),
   mockGetPaymasterData: vi.fn().mockResolvedValue({ paymaster: '0xPaymaster', paymasterData: '0xdata' }),
   mockGetPaymasterStubData: vi.fn().mockResolvedValue({ paymaster: '0xPaymaster', paymasterData: '0xstubdata' }),
-  mockPrepareUserOperation: vi.fn(),
+  mockEstimateUserOperationGas: vi.fn(),
 }));
 
 vi.mock('permissionless', () => ({
@@ -32,7 +39,7 @@ vi.mock('viem/account-abstraction', () => ({
   entryPoint07Abi: [],
   entryPoint07Address: '0x0000000071727De22E5E9d8BAf0edAc6f37da032',
   getUserOperationHash: vi.fn().mockReturnValue('0x' + '00'.repeat(32)),
-  prepareUserOperation: mockPrepareUserOperation,
+  estimateUserOperationGas: mockEstimateUserOperationGas,
 }));
 
 vi.mock('viem', async (importOriginal) => {
@@ -219,44 +226,45 @@ describe('createAzethSmartAccountClient', () => {
   // F-2: native value-spends deterministically AA26'd because the SDK took the
   // bundler's verificationGasLimit estimate verbatim, leaving no headroom for
   // GuardianModule's state-dependent validation gas (cold daily-spend SSTORE,
-  // epoch reset). The client must install a prepareUserOperation hook that
-  // buffers verificationGasLimit for EVERY UserOp.
-  it('installs a prepareUserOperation hook that buffers verificationGasLimit (F-2)', async () => {
-    mockPrepareUserOperation.mockResolvedValue({
-      sender: TEST_SMART_ACCOUNT,
-      nonce: 1n,
-      callData: '0x',
+  // epoch reset). The buffer MUST be applied during gas estimation — a post-prepare
+  // mutation bumps verificationGasLimit after the paymaster has already signed the
+  // (un-buffered) op → AA34, and after the owner sig is computed → AA24.
+  it('buffers verificationGasLimit during gas estimation, with no post-prepare hook (F-2)', async () => {
+    mockEstimateUserOperationGas.mockResolvedValue({
       callGasLimit: 50_000n,
       verificationGasLimit: 100_000n,
       preVerificationGas: 40_000n,
-      maxFeePerGas: 1n,
-      maxPriorityFeePerGas: 1n,
-      signature: '0x',
     });
 
-    await createAzethSmartAccountClient({
+    const client = await createAzethSmartAccountClient({
       publicClient: mockPublicClient(),
       walletClient: mockWalletClient(),
       smartAccountAddress: TEST_SMART_ACCOUNT,
       bundlerUrl: TEST_BUNDLER_URL,
     });
 
+    // The buffer must NOT be wired as a prepareUserOperation hook (that's what
+    // produced the AA34 regression by bumping gas after the paymaster signed).
     const callArgs = mockCreateSmartAccountClient.mock.calls[0][0];
-    expect(callArgs.userOperation).toBeDefined();
-    expect(callArgs.userOperation.prepareUserOperation).toBeTypeOf('function');
+    expect(callArgs.userOperation?.prepareUserOperation).toBeUndefined();
 
-    // Invoke the installed hook: it must delegate to viem's prepareUserOperation
-    // and return the SAME op with only verificationGasLimit scaled up 1.5x.
-    const fakeClient = {} as never;
-    const fakeParams = {} as never;
-    const prepared = await callArgs.userOperation.prepareUserOperation(fakeClient, fakeParams);
+    // It overrides estimateUserOperationGas instead: viem's prepareUserOperation
+    // calls this during the gas step, BEFORE fetching the sending paymaster data
+    // and BEFORE sendUserOperation signs — so the buffered limit is what both cover.
+    const estimate = client as unknown as {
+      estimateUserOperationGas: (args: unknown) => Promise<{
+        verificationGasLimit: bigint;
+        callGasLimit: bigint;
+        preVerificationGas: bigint;
+      }>;
+    };
+    const gas = await estimate.estimateUserOperationGas({});
 
-    expect(mockPrepareUserOperation).toHaveBeenCalledWith(fakeClient, fakeParams);
-    expect(prepared.verificationGasLimit).toBe(150_000n); // 100k * 3/2
-    // Every other field passes through untouched.
-    expect(prepared.callGasLimit).toBe(50_000n);
-    expect(prepared.preVerificationGas).toBe(40_000n);
-    expect(prepared.nonce).toBe(1n);
+    expect(mockEstimateUserOperationGas).toHaveBeenCalled();
+    expect(gas.verificationGasLimit).toBe(150_000n); // 100k * 3/2
+    // Every other gas field passes through untouched.
+    expect(gas.callGasLimit).toBe(50_000n);
+    expect(gas.preVerificationGas).toBe(40_000n);
   });
 });
 

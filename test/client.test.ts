@@ -276,7 +276,8 @@ describe('AzethKit client', () => {
       const result = await kit.getHistory();
 
       expect(result).toBeDefined();
-      expect(Array.isArray(result)).toBe(true);
+      expect(Array.isArray(result.transactions)).toBe(true);
+      expect(typeof result.indexedHistoryUnavailable).toBe('boolean');
     });
 
     it('should delegate discoverServices() to the discover module', async () => {

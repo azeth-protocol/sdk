@@ -16,7 +16,9 @@ import {
   entryPoint07Abi,
   entryPoint07Address,
   getUserOperationHash,
-  prepareUserOperation,
+  estimateUserOperationGas,
+  type EstimateUserOperationGasParameters,
+  type EstimateUserOperationGasReturnType,
 } from 'viem/account-abstraction';
 import { createSmartAccountClient, type SmartAccountClient as PermissionlessSmartAccountClient } from 'permissionless';
 import { AzethAccountAbi } from '@azeth/common/abis';
@@ -209,6 +211,13 @@ export async function createAzethSmartAccount(
  * so over-provisioning is safe. This restores the headroom lost when the flat
  * 300K override was removed alongside the v22 GuardianModule estimation fix, but
  * as a proportional multiplier rather than a magic constant.
+ *
+ * The buffer is applied at GAS-ESTIMATION time (via an estimateUserOperationGas
+ * override), NOT as a post-prepare mutation: prepareUserOperation fetches the
+ * sending paymaster sponsorship signature and signs the owner signature AFTER the
+ * gas step, so bumping verificationGasLimit afterwards would invalidate the
+ * paymaster signature (AA34) and the owner signature (AA24). Buffering during
+ * estimation means both are computed over the buffered value.
  */
 const VERIFICATION_GAS_BUFFER_NUMERATOR = 3n;
 const VERIFICATION_GAS_BUFFER_DENOMINATOR = 2n;
@@ -298,20 +307,6 @@ export async function createAzethSmartAccountClient(
     chain: publicClient.chain,
     bundlerTransport: http(resolvedBundlerUrl),
     client: publicClient,
-    // Absorb state-dependent GuardianModule verification-gas variance (see
-    // applyVerificationGasBuffer). Wrapping prepareUserOperation applies the
-    // buffer to EVERY UserOp submitted through this client — value transfers,
-    // agreement executions, x402 settlement — so a cold daily-spend slot can't
-    // deterministically AA26 a funded account's first value-spend.
-    userOperation: {
-      prepareUserOperation: async (client, parameters) => {
-        const prepared = await prepareUserOperation(client, parameters);
-        return {
-          ...prepared,
-          verificationGasLimit: applyVerificationGasBuffer(prepared.verificationGasLimit),
-        };
-      },
-    },
   };
 
   // Wire paymaster middleware when URL is available.
@@ -321,5 +316,26 @@ export async function createAzethSmartAccountClient(
     clientConfig.paymaster = createPaymasterMiddleware(resolvedPaymasterUrl, paymasterPolicy);
   }
 
-  return createSmartAccountClient(clientConfig) as AzethSmartAccountClient;
+  const client = createSmartAccountClient(clientConfig);
+
+  // Absorb state-dependent GuardianModule verification-gas variance (see
+  // applyVerificationGasBuffer) by overriding estimateUserOperationGas. viem's
+  // prepareUserOperation calls this during the gas step, BEFORE it fetches the
+  // sending paymaster data and BEFORE sendUserOperation signs the owner sig — so
+  // the buffered verificationGasLimit is what both signatures cover. This applies
+  // to EVERY UserOp through the client (transfers, agreement executions, x402
+  // settlement), so a cold daily-spend slot can't deterministically AA26 a funded
+  // account's first value-spend. The override calls the base action directly (not
+  // via the client), so it never recurses into itself.
+  return client.extend((c) => ({
+    estimateUserOperationGas: async (
+      args: EstimateUserOperationGasParameters,
+    ): Promise<EstimateUserOperationGasReturnType> => {
+      const estimate = await estimateUserOperationGas(c, args);
+      return {
+        ...estimate,
+        verificationGasLimit: applyVerificationGasBuffer(estimate.verificationGasLimit),
+      };
+    },
+  })) as AzethSmartAccountClient;
 }

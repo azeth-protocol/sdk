@@ -43,7 +43,7 @@ import { setTokenWhitelist as setTokenWhitelistFn, setProtocolWhitelist as setPr
 import { getBalance, getAllBalances, type BalanceResult } from './account/balance.js';
 import type { AggregatedBalanceResult } from '@azeth/common';
 import { transfer, type TransferParams, type TransferResult } from './account/transfer.js';
-import { getHistory, type HistoryParams, type TransactionRecord } from './account/history.js';
+import { getHistory, type HistoryParams, type TransactionRecord, type HistoryResult } from './account/history.js';
 import { deposit, type DepositParams, type DepositResult } from './account/deposit.js';
 import { registerOnRegistry, updateMetadata, updateMetadataBatch, buildAgentURI, type RegisterParams, type RegisterResult, type MetadataUpdate } from './registry/register.js';
 import {
@@ -622,7 +622,7 @@ export class AzethKit {
    *  @param params - History params (limit, offset)
    *  @param forAccount - Optional: specific smart account (defaults to first)
    */
-  async getHistory(params?: HistoryParams, forAccount?: `0x${string}`): Promise<TransactionRecord[]> {
+  async getHistory(params?: HistoryParams, forAccount?: `0x${string}`): Promise<HistoryResult> {
     const account = forAccount ?? await this.resolveSmartAccount();
     // Pass known token addresses for ERC-20 deposit tracking
     const { TOKENS } = await import('@azeth/common');

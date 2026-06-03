@@ -354,6 +354,45 @@ describe('messaging/xmtp', () => {
     });
   });
 
+  describe('getMessages', () => {
+    beforeEach(async () => {
+      await client.initialize(TEST_PRIVATE_KEY, { env: 'dev', dbEncryptionKey: TEST_ENCRYPTION_KEY });
+    });
+
+    it('returns messages newest-first and requests descending order (F-10)', async () => {
+      const messagesFn = vi.fn().mockResolvedValue([
+        { content: 'oldest', senderInboxId: 'peer', sentAtNs: 100n },
+        { content: 'newest', senderInboxId: 'peer', sentAtNs: 300n },
+        { content: 'middle', senderInboxId: 'peer', sentAtNs: 200n },
+      ]);
+      mockConversationsList.mockResolvedValueOnce([
+        { id: 'conv-1', createdAt: new Date(), peerInboxId: 'peer', messages: messagesFn },
+      ]);
+
+      const msgs = await client.getMessages('conv-1', 10);
+
+      // Sorted newest-first (previously returned oldest-first, so the inbox
+      // "latestMessage" showed the oldest message).
+      expect(msgs.map(m => m.content)).toEqual(['newest', 'middle', 'oldest']);
+      // And it asks XMTP for descending order so the window is the most recent.
+      expect(messagesFn).toHaveBeenCalledWith(expect.objectContaining({ direction: 1 }));
+    });
+
+    it('limit=1 returns the single newest message — the inbox latestMessage (F-10)', async () => {
+      const messagesFn = vi.fn().mockResolvedValue([
+        { content: 'oldest', senderInboxId: 'peer', sentAtNs: 100n },
+        { content: 'newest', senderInboxId: 'peer', sentAtNs: 300n },
+      ]);
+      mockConversationsList.mockResolvedValueOnce([
+        { id: 'conv-1', createdAt: new Date(), peerInboxId: 'peer', messages: messagesFn },
+      ]);
+
+      const msgs = await client.getMessages('conv-1', 1);
+      expect(msgs).toHaveLength(1);
+      expect(msgs[0]?.content).toBe('newest');
+    });
+  });
+
   describe('isReady', () => {
     it('should return false before initialization', () => {
       expect(client.isReady()).toBe(false);
