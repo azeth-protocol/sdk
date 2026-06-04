@@ -20,6 +20,9 @@ export interface TransactionRecord {
   token: `0x${string}` | null;
   blockNumber: bigint;
   timestamp: number;
+  /** 'agreement' when the transfer is part of a recurring payment, else 'transfer'.
+   *  Populated by the indexed (server) path only; undefined on the on-chain fallback. */
+  type?: string;
 }
 
 /** Result of a history query.
@@ -45,6 +48,7 @@ interface ServerHistoryRecord {
   token: `0x${string}` | null;
   blockNumber: string;
   timestamp: number;
+  type?: string;
 }
 
 /** TransferRecorded event emitted by the ReputationModule hook. */
@@ -230,6 +234,7 @@ export async function getHistory(
             token: r.token,
             blockNumber: BigInt(r.blockNumber),
             timestamp: r.timestamp,
+            type: r.type,
           })),
           indexedHistoryUnavailable: false,
         };

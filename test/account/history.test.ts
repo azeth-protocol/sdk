@@ -50,13 +50,15 @@ describe('account/history', () => {
           token: null,
           blockNumber: 50n,
           timestamp: 1700000000,
+          type: 'transfer',
         },
       ]);
       // The indexed server path is authoritative — not a degraded result.
       expect(result.indexedHistoryUnavailable).toBe(false);
-      // bigint fields restored from JSON strings
+      // bigint fields restored from JSON strings; the recurring-payment tag carried through.
       expect(result.transactions[0]?.value).toBe(100n);
       expect(result.transactions[0]?.blockNumber).toBe(50n);
+      expect(result.transactions[0]?.type).toBe('transfer');
       expect(globalThis.fetch).toHaveBeenCalledWith(
         expect.stringContaining('https://api.azeth.ai/api/v1/history'),
       );
