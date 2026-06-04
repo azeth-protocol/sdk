@@ -116,7 +116,7 @@ function parseDataURI(uri: string): ParsedMetadata | null {
     const capabilities = Array.isArray(meta.capabilities)
       ? meta.capabilities.filter((c): c is string => typeof c === 'string')
       : [];
-    const endpoint = typeof meta.endpoint === 'string' ? meta.endpoint : undefined;
+    const endpoint = typeof meta.endpoint === 'string' && meta.endpoint.trim() ? meta.endpoint.trim() : undefined;
 
     return { name, description, entityType, capabilities, endpoint };
   } catch {

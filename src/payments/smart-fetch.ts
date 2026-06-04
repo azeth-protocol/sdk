@@ -10,6 +10,7 @@ import type { PublicClient, WalletClient, Chain, Transport, Account } from 'viem
 import {
   AzethError,
   chainIdToName,
+  isUsableEndpoint,
   type RegistryEntry,
   type DiscoveryParams,
   type EntityType,
@@ -17,6 +18,7 @@ import {
 } from '@azeth/common';
 import { type Fetch402Options, type Fetch402Result, fetch402 } from './x402.js';
 import { discoverServicesWithFallback } from '../registry/discover.js';
+import { resolveIntent, parseCatalogBody, type ResolvedCatalogEntry, type CatalogOption } from './catalog-resolve.js';
 
 /** Options for smartFetch402 */
 export interface SmartFetch402Options extends Fetch402Options {
@@ -33,6 +35,13 @@ export interface SmartFetch402Options extends Fetch402Options {
   preferredService?: bigint;
   // Note: the SSRF guard is `secureGuard`, inherited from Fetch402Options. It is applied
   // here (early skip) AND inside fetch402 (validate + connection pin + redirect policy). (F9)
+  /** Loose intent tokens for catalog navigation (e.g. ["bitcoin"]). When a discovered provider
+   *  serves a catalog, these are matched deterministically against the catalog's param value
+   *  enums to pick the concrete priced route — no model in the loop. (F6) */
+  intent?: string[];
+  /** Structured param overrides for catalog navigation (e.g. {coinId:"bitcoin"}); precise, and
+   *  take precedence over `intent`. (F6) */
+  params?: Record<string, string>;
 }
 
 /** Result from smartFetch402 including routing metadata */
@@ -43,6 +52,9 @@ export interface SmartFetch402Result extends Fetch402Result {
   attemptsCount: number;
   /** Services that failed (for debugging) */
   failedServices?: Array<{ service: RegistryEntry; error: string }>;
+  /** When catalog navigation resolved an intent to a concrete priced route, the receipt of what
+   *  was bought (the entry, the bound params, the concrete URL). (F6) */
+  resolved?: ResolvedCatalogEntry;
 }
 
 /** Compute reputation feedback value from response time.
@@ -105,7 +117,7 @@ export async function smartFetch402(
   const services = discoveryResult.entries
     // Reject empty AND whitespace-only endpoints — registry entries with " "
     // are truthy but produce `fetch(" ")` → "Invalid URL", aborting the fallback (S-3).
-    .filter(s => !!s.endpoint?.trim())
+    .filter(s => isUsableEndpoint(s.endpoint))
     .slice(0, maxRetries);
 
   if (services.length === 0) {
@@ -125,14 +137,16 @@ export async function smartFetch402(
     }
   }
 
+  const hasIntent = !!(options?.intent?.length || (options?.params && Object.keys(options.params).length > 0));
   const failedServices: Array<{ service: RegistryEntry; error: string }> = [];
+  const catalogOptions: Array<{ service: { name: string; tokenId: string; endpoint?: string }; reason?: string; options: CatalogOption[] }> = [];
 
   for (let i = 0; i < services.length; i++) {
     const service = services[i]!;
 
     // Skip services without a usable endpoint (empty or whitespace-only)
-    if (!service.endpoint?.trim()) {
-      failedServices.push({ service, error: 'No endpoint URL' });
+    if (!isUsableEndpoint(service.endpoint)) {
+      failedServices.push({ service, error: 'No usable endpoint (blank, placeholder, or ephemeral tunnel)' });
       continue;
     }
 
@@ -149,16 +163,71 @@ export async function smartFetch402(
         ...options,
         smartAccount: options?.smartAccount,
       });
-
-      // Treat non-success HTTP responses (429 rate-limited, 5xx server error) as
-      // soft failures when no payment was made — try the next service instead of
-      // returning a broken response to the caller.
       const status = result.response.status;
+
+      // Soft-fail non-2xx that didn't pay → try the next provider.
       if (!result.paymentMade && status >= 400) {
         failedServices.push({ service, error: `HTTP ${status}` });
         continue;
       }
 
+      // Catalog navigation (F6): when the caller gave an intent and this is a free 200 that
+      // looks like a service catalog (a menu, not the data), deterministically resolve the
+      // intent to the concrete priced route and pay THAT — instead of returning the menu.
+      if (hasIntent && !result.paymentMade && status === 200) {
+        let bodyText = '';
+        try { bodyText = await result.response.text(); } catch { /* unreadable → treat as non-catalog */ }
+        const catalog = parseCatalogBody(bodyText) ?? (service.catalog && service.catalog.length ? service.catalog : null);
+
+        if (catalog) {
+          const r = resolveIntent({
+            entries: catalog,
+            parentCapabilities: service.capabilities,
+            capability,
+            intent: options?.intent,
+            params: options?.params,
+            baseUrl: service.endpoint,
+          });
+          if (r.resolved) {
+            if (options?.secureGuard) await options.secureGuard(r.resolved.url);
+            const paid = await fetch402(publicClient, walletClient, account, r.resolved.url, {
+              ...options,
+              smartAccount: options?.smartAccount,
+            });
+            if (!paid.paymentMade && paid.response.status >= 400) {
+              failedServices.push({ service, error: `catalog route HTTP ${paid.response.status}` });
+              continue;
+            }
+            return {
+              ...paid,
+              service,
+              attemptsCount: i + 1,
+              failedServices: failedServices.length > 0 ? failedServices : undefined,
+              resolved: r.resolved,
+            };
+          }
+          // Intent didn't resolve against this provider's catalog — record its menu, try the next.
+          catalogOptions.push({
+            service: { name: service.name, tokenId: service.tokenId.toString(), endpoint: service.endpoint },
+            reason: r.reason,
+            options: r.options,
+          });
+          failedServices.push({ service, error: `intent unresolved (${r.reason ?? 'no_match'})` });
+          continue;
+        }
+
+        // Not a catalog → it's a free data endpoint; return it (reconstruct the consumed body).
+        const ct = result.response.headers.get('content-type');
+        return {
+          ...result,
+          response: new Response(bodyText, { status, headers: ct ? { 'content-type': ct } : undefined }),
+          service,
+          attemptsCount: i + 1,
+          failedServices: failedServices.length > 0 ? failedServices : undefined,
+        };
+      }
+
+      // No intent, or a payment was made → existing behaviour.
       return {
         ...result,
         service,
@@ -172,14 +241,21 @@ export async function smartFetch402(
     }
   }
 
-  // All services failed
+  // All services failed — or, when an intent was given, it couldn't be resolved against any
+  // provider's catalog. In the latter case we attach the menu (`options`) so the agent can
+  // refine its intent/params and retry in ONE free round-trip instead of hitting a dead end. (F6)
   throw new AzethError(
-    `All ${services.length} services for capability "${capability}" failed`,
+    catalogOptions.length > 0
+      ? `Could not resolve your intent for capability "${capability}". See "options" for the available catalog entries and their valid params, then retry with matching intent/params.`
+      : `All ${services.length} services for capability "${capability}" failed`,
     'SERVICE_NOT_FOUND',
     {
       capability,
+      intent: options?.intent,
+      params: options?.params,
       attemptsCount: services.length,
       failures: failedServices.map(f => ({ name: f.service.name, error: f.error })),
+      ...(catalogOptions.length > 0 ? { options: catalogOptions } : {}),
     },
   );
 }

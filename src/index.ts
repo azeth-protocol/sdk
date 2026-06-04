@@ -59,6 +59,14 @@ export {
   type GuardedRedirectPolicy,
 } from './payments/secure-fetch.js';
 export {
+  resolveIntent,
+  parseCatalogBody,
+  type ResolveIntentInput,
+  type ResolveIntentResult,
+  type ResolvedCatalogEntry,
+  type CatalogOption,
+} from './payments/catalog-resolve.js';
+export {
   type CreateAgreementParams,
   type AgreementResult,
   findAgreementWithPayee,

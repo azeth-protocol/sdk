@@ -35,7 +35,7 @@ function makeService(overrides: Partial<RegistryEntry> = {}): RegistryEntry {
     name: 'TestService',
     description: 'A test service',
     capabilities: ['price-feed'],
-    endpoint: 'https://service.example.com/api',
+    endpoint: 'https://service.test-svc.io/api',
     active: true,
     reputation: 85,
     ...overrides,
@@ -88,7 +88,7 @@ describe('smartFetch402 (standalone routing layer)', () => {
 
   it('should fall back to second service when first fails', async () => {
     const service1 = makeService({ tokenId: 1n, name: 'FailService', reputation: 95 });
-    const service2 = makeService({ tokenId: 2n, name: 'GoodService', reputation: 80, endpoint: 'https://good.example.com' });
+    const service2 = makeService({ tokenId: 2n, name: 'GoodService', reputation: 80, endpoint: 'https://good.test-svc.io' });
     mockedDiscover.mockResolvedValueOnce({ entries: [service1, service2], source: 'server' });
     mockedFetch402
       .mockRejectedValueOnce(new AzethError('Connection refused', 'NETWORK_ERROR'))
@@ -108,7 +108,7 @@ describe('smartFetch402 (standalone routing layer)', () => {
 
   it('should treat non-success HTTP responses as soft failures and try next', async () => {
     const service1 = makeService({ tokenId: 1n, name: 'RateLimited' });
-    const service2 = makeService({ tokenId: 2n, name: 'Working', endpoint: 'https://working.example.com' });
+    const service2 = makeService({ tokenId: 2n, name: 'Working', endpoint: 'https://working.test-svc.io' });
     mockedDiscover.mockResolvedValueOnce({ entries: [service1, service2], source: 'server' });
     // Service 1 returns 429 (rate limited) with no payment
     mockedFetch402
@@ -132,7 +132,7 @@ describe('smartFetch402 (standalone routing layer)', () => {
 
   it('should throw SERVICE_NOT_FOUND when all services fail', async () => {
     const service1 = makeService({ tokenId: 1n, name: 'Fail1' });
-    const service2 = makeService({ tokenId: 2n, name: 'Fail2', endpoint: 'https://fail2.example.com' });
+    const service2 = makeService({ tokenId: 2n, name: 'Fail2', endpoint: 'https://fail2.test-svc.io' });
     mockedDiscover.mockResolvedValueOnce({ entries: [service1, service2], source: 'server' });
     mockedFetch402
       .mockRejectedValueOnce(new Error('timeout'))
@@ -187,7 +187,7 @@ describe('smartFetch402 (standalone routing layer)', () => {
 
   it('should pre-filter services without an endpoint', async () => {
     const noEndpoint = makeService({ tokenId: 1n, name: 'NoEndpoint', endpoint: undefined });
-    const withEndpoint = makeService({ tokenId: 2n, name: 'HasEndpoint', endpoint: 'https://good.example.com' });
+    const withEndpoint = makeService({ tokenId: 2n, name: 'HasEndpoint', endpoint: 'https://good.test-svc.io' });
     mockedDiscover.mockResolvedValueOnce({ entries: [noEndpoint, withEndpoint], source: 'server' });
     mockedFetch402.mockResolvedValueOnce(makeFetch402Result());
 
@@ -205,7 +205,7 @@ describe('smartFetch402 (standalone routing layer)', () => {
   it('should filter out whitespace-only endpoints before attempting (S-3)', async () => {
     const spaceEndpoint = makeService({ tokenId: 1n, name: 'SpaceEndpoint', endpoint: ' ' });
     const blankEndpoint = makeService({ tokenId: 2n, name: 'BlankEndpoint', endpoint: '   ' });
-    const withEndpoint = makeService({ tokenId: 3n, name: 'HasEndpoint', endpoint: 'https://good.example.com' });
+    const withEndpoint = makeService({ tokenId: 3n, name: 'HasEndpoint', endpoint: 'https://good.test-svc.io' });
     mockedDiscover.mockResolvedValueOnce({ entries: [spaceEndpoint, blankEndpoint, withEndpoint], source: 'server' });
     mockedFetch402.mockResolvedValueOnce(makeFetch402Result());
 
@@ -220,14 +220,14 @@ describe('smartFetch402 (standalone routing layer)', () => {
     expect(result.attemptsCount).toBe(1);
     expect(mockedFetch402).toHaveBeenCalledTimes(1);
     expect(mockedFetch402).toHaveBeenCalledWith(
-      expect.anything(), expect.anything(), TEST_OWNER, 'https://good.example.com',
+      expect.anything(), expect.anything(), TEST_OWNER, 'https://good.test-svc.io',
       expect.anything(),
     );
   });
 
   it('should move preferredService to the front', async () => {
     const service1 = makeService({ tokenId: 1n, name: 'First', reputation: 95 });
-    const service2 = makeService({ tokenId: 2n, name: 'Preferred', reputation: 80, endpoint: 'https://preferred.example.com' });
+    const service2 = makeService({ tokenId: 2n, name: 'Preferred', reputation: 80, endpoint: 'https://preferred.test-svc.io' });
     mockedDiscover.mockResolvedValueOnce({ entries: [service1, service2], source: 'server' });
     mockedFetch402.mockResolvedValueOnce(makeFetch402Result());
 
