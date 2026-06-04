@@ -22,7 +22,9 @@ export interface CreateAgreementParams {
   interval: number; // seconds
   endTime?: bigint; // Unix timestamp after which agreement expires (0 = no expiry)
   maxExecutions?: number;
-  totalCap?: bigint; // Maximum total payout. Defaults to amount * maxExecutions (or amount * 365 if unlimited).
+  // Maximum total payout. When omitted: 0 (pure count cap) if maxExecutions is set — the
+  // agreement completes after exactly maxExecutions payments — otherwise amount * 365 (~1y budget).
+  totalCap?: bigint;
 }
 
 export interface AgreementResult {
@@ -60,6 +62,15 @@ export async function createPaymentAgreement(
   }
   const moduleAddress = requireAddress(addresses, 'paymentAgreementModule');
 
+  // F3: a count cap (maxExecutions) given without an explicit amount cap means a PURE-COUNT
+  // agreement (totalCap = 0), so it completes after exactly `maxExecutions` payments. Deriving
+  // totalCap = amount × maxExecutions instead let pro-rata accrual (≤ MAX_ACCRUAL_MULTIPLIER
+  // intervals per execution) drain that budget in FEWER payments — a maxExecutions:3 agreement
+  // could complete after a single payment. With no count cap either, fall back to ~1y of budget.
+  // (The contract requires totalCap || maxExecutions || endTime to be non-zero, so totalCap=0 is
+  // only ever paired with a non-zero maxExecutions here.)
+  const resolvedTotalCap = params.totalCap ?? (params.maxExecutions ? 0n : params.amount * 365n);
+
   let txHash: `0x${string}`;
   try {
     const data = encodeFunctionData({
@@ -72,7 +83,7 @@ export async function createPaymentAgreement(
         BigInt(params.interval),
         params.endTime ?? 0n,
         BigInt(params.maxExecutions ?? 0),
-        params.totalCap ?? (params.maxExecutions ? params.amount * BigInt(params.maxExecutions) : params.amount * 365n),
+        resolvedTotalCap,
       ],
     });
     txHash = await smartAccountClient.sendTransaction({

@@ -59,6 +59,14 @@ export {
   type GuardedRedirectPolicy,
 } from './payments/secure-fetch.js';
 export {
+  createDefaultSsrfGuard,
+  validateExternalUrl,
+  createPinnedLookup,
+  isPrivateIPv4,
+  isPrivateIPv6,
+  type ValidatedUrl,
+} from './payments/ssrf-guard.js';
+export {
   resolveIntent,
   parseCatalogBody,
   type ResolveIntentInput,

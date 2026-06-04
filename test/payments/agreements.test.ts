@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { keccak256, toBytes } from 'viem';
+import { keccak256, toBytes, encodeFunctionData } from 'viem';
 import { createPaymentAgreement, getAgreement, executeAgreement, findAgreementWithPayee, isAgreementExecutable, getAgreementData } from '../../src/payments/agreements.js';
 import {
   createMockPublicClient,
@@ -166,6 +166,44 @@ describe('payments/agreements', () => {
           interval: 86400,
         }),
       ).rejects.toThrow('Transaction reverted');
+    });
+
+    // F3: maxExecutions must mean "up to N payments". The on-chain default totalCap is what
+    // governs early completion, so assert exactly which totalCap the SDK encodes.
+    describe('totalCap default (F3)', () => {
+      const encodeMock = vi.mocked(encodeFunctionData);
+      function encodedTotalCap(): bigint {
+        const call = encodeMock.mock.calls.find(
+          (c) => (c[0] as { functionName?: string }).functionName === 'createAgreement',
+        );
+        if (!call) throw new Error('createAgreement was not encoded');
+        return ((call[0] as { args: readonly unknown[] }).args)[6] as bigint;
+      }
+
+      beforeEach(() => {
+        publicClient.waitForTransactionReceipt.mockResolvedValue({ status: 'success', logs: [] });
+      });
+
+      it('encodes totalCap=0n (pure count) when maxExecutions is set without an explicit cap', async () => {
+        await createPaymentAgreement(publicClient, smartAccountClient, TEST_ADDRESSES, TEST_ACCOUNT, {
+          payee: TEST_RECIPIENT, token: TEST_TOKEN, amount: 1_000_000n, interval: 86400, maxExecutions: 3,
+        });
+        expect(encodedTotalCap()).toBe(0n);
+      });
+
+      it('encodes a ~1y amount budget (amount × 365) when neither cap is given', async () => {
+        await createPaymentAgreement(publicClient, smartAccountClient, TEST_ADDRESSES, TEST_ACCOUNT, {
+          payee: TEST_RECIPIENT, token: TEST_TOKEN, amount: 1_000_000n, interval: 86400,
+        });
+        expect(encodedTotalCap()).toBe(1_000_000n * 365n);
+      });
+
+      it('passes an explicit totalCap through unchanged (even alongside maxExecutions)', async () => {
+        await createPaymentAgreement(publicClient, smartAccountClient, TEST_ADDRESSES, TEST_ACCOUNT, {
+          payee: TEST_RECIPIENT, token: TEST_TOKEN, amount: 1_000_000n, interval: 86400, maxExecutions: 3, totalCap: 12345n,
+        });
+        expect(encodedTotalCap()).toBe(12345n);
+      });
     });
   });
 

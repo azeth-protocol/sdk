@@ -26,6 +26,12 @@ vi.mock('../src/messaging/xmtp.js', () => ({
   })),
 }));
 
+// F11: the client methods now default-inject the SSRF guard, which does real DNS. Stub it to
+// a no-op spy here so client delegation tests don't hit the network (and so we can assert the
+// default-injection happened) — the guard itself is covered by ssrf-guard.test.ts.
+const { mockCreateGuard } = vi.hoisted(() => ({ mockCreateGuard: vi.fn(() => async () => ({})) }));
+vi.mock('../src/payments/ssrf-guard.js', () => ({ createDefaultSsrfGuard: mockCreateGuard }));
+
 // Mock viem modules
 vi.mock('viem', async (importOriginal) => {
   const actual = await importOriginal<typeof import('viem')>();
@@ -289,13 +295,25 @@ describe('AzethKit client', () => {
       expect(Array.isArray(result)).toBe(true);
     });
 
-    it('should delegate fetch402() to the x402 module', async () => {
+    it('should delegate fetch402() to the x402 module and inject the default SSRF guard (F11)', async () => {
       globalThis.fetch = vi.fn().mockResolvedValue(createMockResponse(200, { data: 'ok' }));
+      mockCreateGuard.mockClear();
 
       const result = await kit.fetch402('https://api.example.com/data');
 
       expect(result).toBeDefined();
       expect(result.paymentMade).toBe(false);
+      // F11: SDK-direct callers are secure by default — the client injects the SSRF guard.
+      expect(mockCreateGuard).toHaveBeenCalled();
+    });
+
+    it('skips the default SSRF guard when unsafelyDisableSsrfGuard is set (F11 opt-out)', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(createMockResponse(200, { data: 'ok' }));
+      mockCreateGuard.mockClear();
+
+      await kit.fetch402('https://api.example.com/data', { unsafelyDisableSsrfGuard: true });
+
+      expect(mockCreateGuard).not.toHaveBeenCalled();
     });
 
     it('should delegate publishService() to the register module', async () => {

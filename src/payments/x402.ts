@@ -121,8 +121,15 @@ export interface Fetch402Options {
   smartAccountTransfer?: SmartAccountTransferCallback;
   /** SSRF guard for the (untrusted) target URL: validates each connection hop (HTTPS +
    *  non-private IP) and returns a dispatcher pinned to the validated IP (anti DNS-rebinding).
-   *  Injected by the MCP trust boundary; absent for SDK-direct/trusted use (passthrough). (F9) */
+   *  The AzethKit client methods (kit.fetch402 / kit.smartFetch402) inject a default guard
+   *  (createDefaultSsrfGuard) when this is omitted, so SDK-direct callers are secure by
+   *  default (F11). Pass a custom guard to override. The low-level fetch402()/smartFetch402()
+   *  functions do NOT default it — they apply only what is passed here. (F9) */
   secureGuard?: SecureFetchGuard;
+  /** Opt OUT of the AzethKit client methods' default SSRF guard. Only for intentional
+   *  private/local discovery you fully trust — disables HTTPS enforcement, private-IP
+   *  blocking, and the DNS-rebinding connection pin. Ignored by the low-level functions. (F11) */
+  unsafelyDisableSsrfGuard?: boolean;
 }
 
 export interface Fetch402Result {

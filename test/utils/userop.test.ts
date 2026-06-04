@@ -4,6 +4,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 const {
   mockCreateSmartAccountClient,
   mockToSmartAccount,
+  mockCreateBundlerClient,
   mockGetPaymasterData,
   mockGetPaymasterStubData,
   mockEstimateUserOperationGas,
@@ -21,10 +22,15 @@ const {
     base['extend'] = (fn: (c: Record<string, unknown>) => Record<string, unknown>) => Object.assign(base, fn(base));
     return base;
   }),
-  mockToSmartAccount: vi.fn().mockResolvedValue({
+  // Capture the toSmartAccount config so tests can invoke the estimateGas hook the
+  // SDK installs on account.userOperation (where the verification-gas buffer now lives).
+  mockToSmartAccount: vi.fn().mockImplementation((config: { userOperation?: unknown }) => ({
     address: '0xDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD',
     type: 'smart',
-  }),
+    userOperation: config.userOperation,
+  })),
+  // Bundler client used by the estimateGas hook — a truthy stub is enough.
+  mockCreateBundlerClient: vi.fn().mockReturnValue({ __bundlerClient: true }),
   mockGetPaymasterData: vi.fn().mockResolvedValue({ paymaster: '0xPaymaster', paymasterData: '0xdata' }),
   mockGetPaymasterStubData: vi.fn().mockResolvedValue({ paymaster: '0xPaymaster', paymasterData: '0xstubdata' }),
   mockEstimateUserOperationGas: vi.fn(),
@@ -40,6 +46,7 @@ vi.mock('viem/account-abstraction', () => ({
   entryPoint07Address: '0x0000000071727De22E5E9d8BAf0edAc6f37da032',
   getUserOperationHash: vi.fn().mockReturnValue('0x' + '00'.repeat(32)),
   estimateUserOperationGas: mockEstimateUserOperationGas,
+  createBundlerClient: mockCreateBundlerClient,
 }));
 
 vi.mock('viem', async (importOriginal) => {
@@ -223,48 +230,77 @@ describe('createAzethSmartAccountClient', () => {
     ).rejects.toThrow('bundlerUrl is required');
   });
 
-  // F-2: native value-spends deterministically AA26'd because the SDK took the
+  // C1 / F-2: native value-spends deterministically AA26'd because the SDK took the
   // bundler's verificationGasLimit estimate verbatim, leaving no headroom for
-  // GuardianModule's state-dependent validation gas (cold daily-spend SSTORE,
-  // epoch reset). The buffer MUST be applied during gas estimation — a post-prepare
-  // mutation bumps verificationGasLimit after the paymaster has already signed the
-  // (un-buffered) op → AA34, and after the owner sig is computed → AA24.
-  it('buffers verificationGasLimit during gas estimation, with no post-prepare hook (F-2)', async () => {
+  // GuardianModule's state-dependent validation gas (the cold daily-spend SSTORE, which
+  // is gated behind the owner-sig check so the stub-signature estimate never measures
+  // it). The 1.5x buffer MUST be applied DURING gas estimation — a post-prepare mutation
+  // bumps verificationGasLimit after the paymaster has already signed the (un-buffered)
+  // op → AA34, and after the owner sig is computed → AA24.
+  //
+  // The buffer is wired via the smart account's estimateGas hook
+  // (account.userOperation.estimateGas), which viem's prepareUserOperation invokes during
+  // the gas step. It must NOT be a trailing client.extend(estimateUserOperationGas):
+  // permissionless binds sendUserOperation/prepareUserOperation to the inner bundler
+  // client, so a trailing extend's override is never consulted (the original bug — dead
+  // code that left AA26 live in production despite this test passing against a mock whose
+  // .extend mutated in place).
+  it('buffers verificationGasLimit via the account estimateGas hook — not client.extend, not a prepareUserOperation hook (C1)', async () => {
     mockEstimateUserOperationGas.mockResolvedValue({
       callGasLimit: 50_000n,
       verificationGasLimit: 100_000n,
       preVerificationGas: 40_000n,
     });
 
-    const client = await createAzethSmartAccountClient({
+    await createAzethSmartAccountClient({
       publicClient: mockPublicClient(),
       walletClient: mockWalletClient(),
       smartAccountAddress: TEST_SMART_ACCOUNT,
       bundlerUrl: TEST_BUNDLER_URL,
     });
 
-    // The buffer must NOT be wired as a prepareUserOperation hook (that's what
-    // produced the AA34 regression by bumping gas after the paymaster signed).
     const callArgs = mockCreateSmartAccountClient.mock.calls[0][0];
+
+    // Not a prepareUserOperation hook (that path caused the AA34 regression).
     expect(callArgs.userOperation?.prepareUserOperation).toBeUndefined();
 
-    // It overrides estimateUserOperationGas instead: viem's prepareUserOperation
-    // calls this during the gas step, BEFORE fetching the sending paymaster data
-    // and BEFORE sendUserOperation signs — so the buffered limit is what both cover.
-    const estimate = client as unknown as {
-      estimateUserOperationGas: (args: unknown) => Promise<{
-        verificationGasLimit: bigint;
-        callGasLimit: bigint;
-        preVerificationGas: bigint;
-      }>;
+    // The buffer lives on the smart account's estimateGas hook, which viem invokes
+    // during the gas step (before the paymaster + owner signatures).
+    const account = callArgs.account as {
+      userOperation?: {
+        estimateGas?: (uo: unknown) => Promise<
+          { verificationGasLimit: bigint; callGasLimit: bigint; preVerificationGas: bigint } | undefined
+        >;
+      };
     };
-    const gas = await estimate.estimateUserOperationGas({});
+    expect(account.userOperation?.estimateGas).toBeTypeOf('function');
+
+    const gas = await account.userOperation!.estimateGas!({});
 
     expect(mockEstimateUserOperationGas).toHaveBeenCalled();
-    expect(gas.verificationGasLimit).toBe(150_000n); // 100k * 3/2
+    expect(gas?.verificationGasLimit).toBe(150_000n); // 100k * 3/2
     // Every other gas field passes through untouched.
-    expect(gas.callGasLimit).toBe(50_000n);
-    expect(gas.preVerificationGas).toBe(40_000n);
+    expect(gas?.callGasLimit).toBe(50_000n);
+    expect(gas?.preVerificationGas).toBe(40_000n);
+  });
+
+  it('estimateGas hook degrades to viem’s own estimate (returns undefined) when the bundler estimate throws (C1 safety)', async () => {
+    mockEstimateUserOperationGas.mockRejectedValueOnce(new Error('bundler unavailable'));
+
+    await createAzethSmartAccountClient({
+      publicClient: mockPublicClient(),
+      walletClient: mockWalletClient(),
+      smartAccountAddress: TEST_SMART_ACCOUNT,
+      bundlerUrl: TEST_BUNDLER_URL,
+    });
+
+    const callArgs = mockCreateSmartAccountClient.mock.calls[0][0];
+    const account = callArgs.account as {
+      userOperation?: { estimateGas?: (uo: unknown) => Promise<unknown> };
+    };
+    // On any failure the hook returns undefined so viem falls back to its own
+    // (un-buffered) estimate — never worse than before the fix.
+    await expect(account.userOperation!.estimateGas!({})).resolves.toBeUndefined();
   });
 });
 

@@ -17,8 +17,10 @@ import {
   entryPoint07Address,
   getUserOperationHash,
   estimateUserOperationGas,
+  createBundlerClient,
+  type BundlerClient,
+  type UserOperationRequest,
   type EstimateUserOperationGasParameters,
-  type EstimateUserOperationGasReturnType,
 } from 'viem/account-abstraction';
 import { createSmartAccountClient, type SmartAccountClient as PermissionlessSmartAccountClient } from 'permissionless';
 import { AzethAccountAbi } from '@azeth/common/abis';
@@ -67,13 +69,18 @@ export async function createAzethSmartAccount(
   walletClient: WalletClient<Transport, Chain, Account>,
   smartAccountAddress: `0x${string}`,
   guardianKey?: `0x${string}`,
+  estimateBundlerClient?: BundlerClient,
 ): Promise<SmartAccount> {
   const chainId = publicClient.chain?.id;
   if (!chainId) {
     throw new AzethError('Public client must have a chain configured', 'NETWORK_ERROR');
   }
 
-  return toSmartAccount({
+  // Late-bound self-reference so the estimateGas hook (invoked later, inside
+  // prepareUserOperation) can pass `account` to estimateUserOperationGas.
+  let smartAccountRef: SmartAccount | undefined;
+
+  const account = await toSmartAccount({
     client: publicClient,
 
     entryPoint: {
@@ -194,7 +201,54 @@ export async function createAzethSmartAccount(
       }
       return stub65;
     },
+
+    // Apply the verification-gas buffer DURING estimation, via viem's account-level
+    // estimateGas hook. viem's prepareUserOperation invokes this hook BEFORE it fetches
+    // the sending-paymaster signature and BEFORE sendUserOperation signs the owner sig,
+    // so the buffered verificationGasLimit is what BOTH signatures cover (no AA34/AA24).
+    //
+    // This replaces a trailing `client.extend(estimateUserOperationGas)` override that
+    // was dead code: permissionless binds prepareUserOperation to the inner bundler
+    // client, which a trailing client.extend never reaches — so the bundler's raw
+    // (un-buffered) estimate was used and an account's FIRST value-spend of the day
+    // (cold daily-spend SSTORE, gated behind the owner-sig check in GuardianModule)
+    // deterministically reverted with AA26.
+    //
+    // Passing `account` to estimateUserOperationGas is recursion-safe: that action
+    // re-runs prepareUserOperation WITHOUT the 'gas' property, so this hook is not
+    // re-entered. On ANY failure (or when no bundler client is available) we return
+    // undefined → viem's own (un-buffered) estimate runs, i.e. never worse than before.
+    userOperation: {
+      estimateGas: async (userOperation: UserOperationRequest) => {
+        if (!smartAccountRef || !estimateBundlerClient) return undefined;
+        try {
+          const hasPaymaster = Boolean((userOperation as { paymaster?: `0x${string}` }).paymaster);
+          const estimate = await estimateUserOperationGas(estimateBundlerClient, {
+            account: smartAccountRef,
+            // Mirror viem's own estimate call (prepareUserOperation gas step): zeroish
+            // defaults so bundlers don't reject nullish gas, plus paymaster gas fields
+            // only when a paymaster is present.
+            callGasLimit: 0n,
+            preVerificationGas: 0n,
+            verificationGasLimit: 0n,
+            ...(hasPaymaster
+              ? { paymasterPostOpGasLimit: 0n, paymasterVerificationGasLimit: 0n }
+              : {}),
+            ...userOperation,
+          } as EstimateUserOperationGasParameters);
+          return {
+            ...estimate,
+            verificationGasLimit: applyVerificationGasBuffer(estimate.verificationGasLimit),
+          };
+        } catch {
+          return undefined;
+        }
+      },
+    },
   });
+
+  smartAccountRef = account;
+  return account;
 }
 
 /**
@@ -212,8 +266,8 @@ export async function createAzethSmartAccount(
  * 300K override was removed alongside the v22 GuardianModule estimation fix, but
  * as a proportional multiplier rather than a magic constant.
  *
- * The buffer is applied at GAS-ESTIMATION time (via an estimateUserOperationGas
- * override), NOT as a post-prepare mutation: prepareUserOperation fetches the
+ * The buffer is applied at GAS-ESTIMATION time (via the smart account's estimateGas
+ * hook), NOT as a post-prepare mutation: prepareUserOperation fetches the
  * sending paymaster sponsorship signature and signs the owner signature AFTER the
  * gas step, so bumping verificationGasLimit afterwards would invalidate the
  * paymaster signature (AA34) and the owner signature (AA24). Buffering during
@@ -294,11 +348,19 @@ export async function createAzethSmartAccountClient(
     }
   }
 
+  // Bundler client used by the smart account's estimateGas hook to apply the
+  // verification-gas buffer during estimation (see createAzethSmartAccount).
+  const estimateBundlerClient = createBundlerClient({
+    client: publicClient,
+    transport: http(resolvedBundlerUrl),
+  });
+
   const smartAccount = await createAzethSmartAccount(
     publicClient,
     walletClient,
     smartAccountAddress,
     config.guardianKey,
+    estimateBundlerClient,
   );
 
   // Build SmartAccountClient config with optional paymaster
@@ -318,24 +380,11 @@ export async function createAzethSmartAccountClient(
 
   const client = createSmartAccountClient(clientConfig);
 
-  // Absorb state-dependent GuardianModule verification-gas variance (see
-  // applyVerificationGasBuffer) by overriding estimateUserOperationGas. viem's
-  // prepareUserOperation calls this during the gas step, BEFORE it fetches the
-  // sending paymaster data and BEFORE sendUserOperation signs the owner sig — so
-  // the buffered verificationGasLimit is what both signatures cover. This applies
-  // to EVERY UserOp through the client (transfers, agreement executions, x402
-  // settlement), so a cold daily-spend slot can't deterministically AA26 a funded
-  // account's first value-spend. The override calls the base action directly (not
-  // via the client), so it never recurses into itself.
-  return client.extend((c) => ({
-    estimateUserOperationGas: async (
-      args: EstimateUserOperationGasParameters,
-    ): Promise<EstimateUserOperationGasReturnType> => {
-      const estimate = await estimateUserOperationGas(c, args);
-      return {
-        ...estimate,
-        verificationGasLimit: applyVerificationGasBuffer(estimate.verificationGasLimit),
-      };
-    },
-  })) as AzethSmartAccountClient;
+  // The verification-gas buffer is applied via the smart account's estimateGas hook
+  // (see createAzethSmartAccount), NOT a trailing client.extend: permissionless binds
+  // sendUserOperation/prepareUserOperation to the inner bundler client, so a trailing
+  // client.extend's estimateUserOperationGas override is never consulted (dead code →
+  // AA26 on cold daily-spend slots). The hook runs inside prepareUserOperation, before
+  // the paymaster and owner signatures, so the buffered limit is covered by both.
+  return client as AzethSmartAccountClient;
 }

@@ -18,12 +18,19 @@ vi.mock('../../src/payments/x402.js', () => ({
   fetch402: vi.fn(),
 }));
 
-import { smartFetch402, computeFeedbackValue } from '../../src/payments/smart-fetch.js';
+// Mock the secureFetch probe (intent mode never blind-pays — it probes first)
+vi.mock('../../src/payments/secure-fetch.js', () => ({
+  secureFetch: vi.fn(),
+}));
+
+import { smartFetch402, computeFeedbackValue, intentMatchesProvider } from '../../src/payments/smart-fetch.js';
 import { discoverServicesWithFallback } from '../../src/registry/discover.js';
 import { fetch402 } from '../../src/payments/x402.js';
+import { secureFetch } from '../../src/payments/secure-fetch.js';
 
 const mockedDiscover = vi.mocked(discoverServicesWithFallback);
 const mockedFetch402 = vi.mocked(fetch402);
+const mockedSecureFetch = vi.mocked(secureFetch);
 
 const SERVER_URL = 'https://api.azeth.ai';
 
@@ -299,5 +306,136 @@ describe('computeFeedbackValue', () => {
   it('returns 30 for response 2000ms or more', () => {
     expect(computeFeedbackValue(2000)).toBe(30);
     expect(computeFeedbackValue(10000)).toBe(30);
+  });
+});
+
+describe('intent-native navigation (N1 universal: catalog + non-catalog providers)', () => {
+  const publicClient = createMockPublicClient();
+  const walletClient = createMockWalletClient();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const CATALOG_BODY = JSON.stringify({
+    catalog: [
+      { name: 'Coin Price', path: '/{coinId}', params: { coinId: 'bitcoin, ethereum' }, capabilities: ['price-feed'], pricing: '$0.01/request' },
+    ],
+  });
+
+  function probe(status: number, body = ''): Response {
+    return new Response(body, { status, headers: body ? { 'content-type': 'application/json' } : undefined });
+  }
+
+  it('intentMatchesProvider: route asset must overlap the intent', () => {
+    const eth = makeService({ endpoint: 'https://svc.test-svc.io/api/v1/pricing/ethereum' });
+    expect(intentMatchesProvider(['ethereum'], undefined, eth)).toBe(true);
+    expect(intentMatchesProvider(['dogecoin'], undefined, eth)).toBe(false);
+    expect(intentMatchesProvider(undefined, { coinId: 'ethereum' }, eth)).toBe(true);
+    // query-string assets count too
+    const q = makeService({ endpoint: 'https://svc.test-svc.io/price?coin=solana' });
+    expect(intentMatchesProvider(['solana'], undefined, q)).toBe(true);
+    expect(intentMatchesProvider(['cardano'], undefined, q)).toBe(false);
+  });
+
+  it('catalog provider: resolves the intent and pays the concrete priced route', async () => {
+    const svc = makeService({ endpoint: 'https://svc.test-svc.io/api/v1/pricing', reputation: 100 });
+    mockedDiscover.mockResolvedValueOnce({ entries: [svc], source: 'server' });
+    mockedSecureFetch.mockResolvedValueOnce(probe(200, CATALOG_BODY)); // probe → catalog
+    mockedFetch402.mockResolvedValueOnce(makeFetch402Result({ paymentMethod: 'smart-account' }));
+
+    const result = await smartFetch402(
+      publicClient as any, walletClient as any, TEST_OWNER, SERVER_URL, 'price-feed',
+      { intent: ['bitcoin'] },
+    );
+
+    expect(result.paymentMade).toBe(true);
+    expect(result.resolved?.url).toBe('https://svc.test-svc.io/api/v1/pricing/bitcoin');
+    expect(mockedFetch402).toHaveBeenCalledWith(
+      expect.anything(), expect.anything(), TEST_OWNER,
+      'https://svc.test-svc.io/api/v1/pricing/bitcoin', expect.anything(),
+    );
+  });
+
+  it('NON-catalog provider: pays a fixed route when the intent matches the route (universal)', async () => {
+    const svc = makeService({ endpoint: 'https://svc.test-svc.io/api/v1/pricing/ethereum' });
+    mockedDiscover.mockResolvedValueOnce({ entries: [svc], source: 'server' });
+    mockedSecureFetch.mockResolvedValueOnce(probe(402)); // probe → priced route, no catalog
+    mockedFetch402.mockResolvedValueOnce(makeFetch402Result({ paymentMethod: 'smart-account' }));
+
+    const result = await smartFetch402(
+      publicClient as any, walletClient as any, TEST_OWNER, SERVER_URL, 'price-feed',
+      { intent: ['ethereum'] },
+    );
+
+    expect(result.paymentMade).toBe(true);
+    expect(result.resolved?.url).toBe('https://svc.test-svc.io/api/v1/pricing/ethereum');
+    expect(mockedFetch402).toHaveBeenCalledTimes(1);
+  });
+
+  it('N1: NEVER pays a fixed route whose asset does not match the intent (dogecoin ≠ /ethereum)', async () => {
+    const svc = makeService({ endpoint: 'https://svc.test-svc.io/api/v1/pricing/ethereum' });
+    mockedDiscover.mockResolvedValueOnce({ entries: [svc], source: 'server' });
+    mockedSecureFetch.mockResolvedValueOnce(probe(402)); // priced route, no catalog
+
+    await expect(
+      smartFetch402(
+        publicClient as any, walletClient as any, TEST_OWNER, SERVER_URL, 'price-feed',
+        { intent: ['dogecoin'] },
+      ),
+    ).rejects.toThrow(AzethError);
+
+    // The critical assertion: NO payment was attempted for the wrong asset.
+    expect(mockedFetch402).not.toHaveBeenCalled();
+  });
+
+  it('N1 fallthrough: catalog miss + non-matching fixed route → pays nothing, returns options', async () => {
+    const catalogSvc = makeService({ tokenId: 1n, name: 'Catalog', endpoint: 'https://a.test-svc.io/api/v1/pricing', reputation: 100 });
+    const fixedSvc = makeService({ tokenId: 2n, name: 'EthOnly', endpoint: 'https://b.test-svc.io/api/v1/pricing/ethereum', reputation: 85 });
+    mockedDiscover.mockResolvedValueOnce({ entries: [catalogSvc, fixedSvc], source: 'server' });
+    // provider #1 → catalog (won't match dogecoin); provider #2 → fixed 402 ethereum route
+    mockedSecureFetch
+      .mockResolvedValueOnce(probe(200, CATALOG_BODY))
+      .mockResolvedValueOnce(probe(402));
+
+    let thrown: AzethError | undefined;
+    try {
+      await smartFetch402(
+        publicClient as any, walletClient as any, TEST_OWNER, SERVER_URL, 'price-feed',
+        { intent: ['dogecoin'] },
+      );
+    } catch (e) {
+      thrown = e as AzethError;
+    }
+
+    expect(thrown).toBeInstanceOf(AzethError);
+    expect(thrown!.code).toBe('SERVICE_NOT_FOUND');
+    // No money moved on the wrong asset, despite a payable fallthrough provider existing.
+    expect(mockedFetch402).not.toHaveBeenCalled();
+    // The catalog menu is surfaced so the agent can refine + retry.
+    expect((thrown!.details as any)?.options).toBeDefined();
+  });
+
+  it('N2: no-intent call surfaces a free-200 catalog as options (not a raw body)', async () => {
+    const svc = makeService({ endpoint: 'https://svc.test-svc.io/api/v1/pricing', reputation: 100 });
+    mockedDiscover.mockResolvedValueOnce({ entries: [svc], source: 'server' });
+    // no intent → no-intent path uses fetch402 directly; provider returns a free-200 catalog
+    mockedFetch402.mockResolvedValueOnce(makeFetch402Result({
+      response: new Response(CATALOG_BODY, { status: 200, headers: { 'content-type': 'application/json' } }),
+      paymentMade: false,
+      paymentMethod: 'none',
+    }));
+
+    let thrown: AzethError | undefined;
+    try {
+      await smartFetch402(publicClient as any, walletClient as any, TEST_OWNER, SERVER_URL, 'price-feed');
+    } catch (e) {
+      thrown = e as AzethError;
+    }
+
+    expect(thrown).toBeInstanceOf(AzethError);
+    expect((thrown!.details as any)?.options).toBeDefined();
+    // It must NOT report a paid success or charge for the menu.
+    expect(mockedFetch402).toHaveBeenCalledTimes(1);
   });
 });

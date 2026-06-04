@@ -57,6 +57,7 @@ import {
 import { discoverServices, getRegistryEntry } from './registry/discover.js';
 import { fetch402, type Fetch402Options, type Fetch402Result, type SmartAccountTransferCallback } from './payments/x402.js';
 import { smartFetch402 as smartFetch402Fn, computeFeedbackValue, FAILURE_PENALTY_VALUE, type SmartFetch402Options, type SmartFetch402Result } from './payments/smart-fetch.js';
+import { createDefaultSsrfGuard } from './payments/ssrf-guard.js';
 import { createPaymentAgreement, getAgreement, executeAgreement, executeAgreementAsKeeper, cancelAgreement as cancelAgreementFn, findAgreementWithPayee, getAgreementCount as getAgreementCountFn, canExecutePayment as canExecutePaymentFn, getNextExecutionTime as getNextExecutionTimeFn, getAgreementData as getAgreementDataFn, type CreateAgreementParams, type AgreementResult } from './payments/agreements.js';
 import { createSignedFetch } from './auth/erc8128.js';
 import { XMTPClient, type SendMessageParams } from './messaging/xmtp.js';
@@ -824,10 +825,16 @@ export class AzethKit {
         };
       }
 
+      // F11: SDK-direct callers are secure by default — inject the SSRF guard for the
+      // (untrusted) target URL unless the caller supplied their own or explicitly opted out.
+      const secureGuard = options?.secureGuard
+        ?? (options?.unsafelyDisableSsrfGuard ? undefined : createDefaultSsrfGuard());
+
       let result: Fetch402Result;
       try {
         result = await fetch402(this.publicClient, this.walletClient, this.address, url, {
           ...options,
+          secureGuard,
           smartAccount,
           smartAccountTransfer,
         });
@@ -944,6 +951,11 @@ export class AzethKit {
         };
       }
 
+      // F11: secure-by-default — inject the SSRF guard for the (untrusted, registry-discovered)
+      // endpoints unless the caller supplied their own guard or explicitly opted out.
+      const secureGuard = options?.secureGuard
+        ?? (options?.unsafelyDisableSsrfGuard ? undefined : createDefaultSsrfGuard());
+
       const result = await smartFetch402Fn(
         this.publicClient,
         this.walletClient,
@@ -952,6 +964,7 @@ export class AzethKit {
         capability,
         {
           ...options,
+          secureGuard,
           smartAccount,
           smartAccountTransfer,
         },
