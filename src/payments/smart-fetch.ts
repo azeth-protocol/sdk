@@ -31,6 +31,8 @@ export interface SmartFetch402Options extends Fetch402Options {
   entityType?: EntityType;
   /** Preferred service tokenId — tried first if available in results */
   preferredService?: bigint;
+  // Note: the SSRF guard is `secureGuard`, inherited from Fetch402Options. It is applied
+  // here (early skip) AND inside fetch402 (validate + connection pin + redirect policy). (F9)
 }
 
 /** Result from smartFetch402 including routing metadata */
@@ -135,6 +137,14 @@ export async function smartFetch402(
     }
 
     try {
+      // SSRF guard: the discovered endpoint is published by an arbitrary third party, so
+      // validate it (HTTPS + non-private/reserved IP) before the fetch. The same guard is
+      // re-applied (and pins the connection) inside fetch402; this early call lets us skip
+      // a bad service without entering the payment flow. On rejection the throw is caught
+      // below and we move to the next service. (F9)
+      if (options?.secureGuard) {
+        await options.secureGuard(service.endpoint);
+      }
       const result = await fetch402(publicClient, walletClient, account, service.endpoint, {
         ...options,
         smartAccount: options?.smartAccount,

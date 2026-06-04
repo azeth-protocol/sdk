@@ -53,6 +53,12 @@ export {
 // Payment operations
 export { type Fetch402Options, type Fetch402Result, verifySettlementReceipt } from './payments/x402.js';
 export {
+  secureFetch,
+  type SecureFetchGuard,
+  type SecureFetchOptions,
+  type GuardedRedirectPolicy,
+} from './payments/secure-fetch.js';
+export {
   type CreateAgreementParams,
   type AgreementResult,
   findAgreementWithPayee,

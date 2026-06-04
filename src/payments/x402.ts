@@ -10,6 +10,7 @@ import {
 } from 'viem';
 import { AzethError, formatTokenAmount, type X402PaymentRequirement, TOKENS } from '@azeth/common';
 import { withRetry } from '../utils/retry.js';
+import { secureFetch, type SecureFetchGuard } from './secure-fetch.js';
 import {
   createSIWxPayload,
   encodeSIWxHeader,
@@ -118,6 +119,10 @@ export interface Fetch402Options {
    *  When provided, the payment goes through the smart account (with guardian guardrails)
    *  instead of the x402 facilitator settling from the EOA. */
   smartAccountTransfer?: SmartAccountTransferCallback;
+  /** SSRF guard for the (untrusted) target URL: validates each connection hop (HTTPS +
+   *  non-private IP) and returns a dispatcher pinned to the validated IP (anti DNS-rebinding).
+   *  Injected by the MCP trust boundary; absent for SDK-direct/trusted use (passthrough). (F9) */
+  secureGuard?: SecureFetchGuard;
 }
 
 export interface Fetch402Result {
@@ -169,11 +174,15 @@ export async function fetch402(
   // Initial request (retryable -- idempotent read)
   let response: Response;
   try {
-    response = await withRetry(() => fetch(url, {
+    response = await withRetry(() => secureFetch(url, {
       method,
       headers,
       body: options?.body,
       signal: AbortSignal.timeout(fetchTimeout),
+      // Untrusted target: validate + pin each hop. Initial GET carries no credentials,
+      // so re-validated public redirects may be followed. (F9)
+      guard: options?.secureGuard,
+      guardedRedirect: 'follow',
     }));
   } catch (err: unknown) {
     if (err instanceof AzethError) throw err;
@@ -447,11 +456,15 @@ export async function fetch402(
 
   const startTime = Date.now();
   try {
-    response = await fetch(url, {
+    response = await secureFetch(url, {
       method,
       headers: retryHeaders,
       body: options?.body,
       signal: AbortSignal.timeout(fetchTimeout),
+      // Carries a signed ERC-3009 payment authorization — refuse any redirect so the
+      // proof is never re-sent to a redirected host. (F9)
+      guard: options?.secureGuard,
+      guardedRedirect: 'error',
     });
   } catch (err: unknown) {
     if (err instanceof AzethError) throw err;
@@ -615,11 +628,15 @@ async function attemptSIWx(
     const siwxHeaders = new Headers(options?.headers);
     siwxHeaders.set('SIGN-IN-WITH-X', headerValue);
 
-    const siwxResponse = await fetch(url, {
+    const siwxResponse = await secureFetch(url, {
       method,
       headers: siwxHeaders,
       body: options?.body,
       signal: AbortSignal.timeout(fetchTimeout),
+      // Carries a SIWx identity signature — refuse any redirect so the session header
+      // is never re-sent to a redirected host. (F9)
+      guard: options?.secureGuard,
+      guardedRedirect: 'error',
     });
 
     // If NOT 402, SIWx succeeded — access granted without payment
@@ -788,11 +805,14 @@ async function attemptSmartAccountPayment(
     retryHeaders.set('X-Payment-From', smartAccount);
 
     const startTime = Date.now();
-    const response = await fetch(url, {
+    const response = await secureFetch(url, {
       method,
       headers: retryHeaders,
       body: options.body,
       signal: AbortSignal.timeout(fetchTimeout),
+      // Carries pre-settled payment proof headers (X-Payment-Tx) — refuse any redirect. (F9)
+      guard: options?.secureGuard,
+      guardedRedirect: 'error',
     });
     const responseTimeMs = Date.now() - startTime;
 
