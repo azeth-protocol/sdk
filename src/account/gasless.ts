@@ -18,6 +18,7 @@ import {
 } from '@azeth/common';
 import { requireAddress } from '../utils/addresses.js';
 import { withRetry } from '../utils/retry.js';
+import { secureFetch } from '../payments/secure-fetch.js';
 import type { CreateAccountParams, CreateAccountResult } from './create.js';
 
 /** Result from the relay endpoint */
@@ -102,7 +103,7 @@ export async function submitToRelay(
   signature: `0x${string}`,
   chain: string,
 ): Promise<CreateAccountResult | null> {
-  const response = await fetch(`${serverUrl}/api/v1/relay/create-account`, {
+  const response = await secureFetch(`${serverUrl}/api/v1/relay/create-account`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({

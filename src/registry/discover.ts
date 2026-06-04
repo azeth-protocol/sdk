@@ -10,6 +10,7 @@ import {
 } from '@azeth/common';
 import { AzethOracleAbi } from '@azeth/common/abis';
 import { withRetry } from '../utils/retry.js';
+import { secureFetch } from '../payments/secure-fetch.js';
 
 /** Discover services from the Azeth server's trust registry index.
  *
@@ -36,7 +37,7 @@ export async function discoverServices(
 
   let response: Response;
   try {
-    response = await withRetry(() => fetch(`${serverUrl}/api/v1/registry/discover?${queryParams}`));
+    response = await withRetry(() => secureFetch(`${serverUrl}/api/v1/registry/discover?${queryParams}`));
   } catch (err: unknown) {
     if (err instanceof AzethError) throw err;
     throw new AzethError(
@@ -64,7 +65,7 @@ export async function getRegistryEntry(
 ): Promise<RegistryEntry | null> {
   let response: Response;
   try {
-    response = await withRetry(() => fetch(`${serverUrl}/api/v1/registry/${tokenId}`));
+    response = await withRetry(() => secureFetch(`${serverUrl}/api/v1/registry/${tokenId}`));
   } catch (err: unknown) {
     if (err instanceof AzethError) throw err;
     throw new AzethError(

@@ -4,6 +4,7 @@ import {
   type Transport,
 } from 'viem';
 import { withRetry } from '../utils/retry.js';
+import { secureFetch } from '../payments/secure-fetch.js';
 
 export interface HistoryParams {
   limit?: number;
@@ -221,7 +222,7 @@ export async function getHistory(
     if (params?.offset) queryParams.set('offset', params.offset.toString());
 
     try {
-      const response = await withRetry(() => fetch(`${serverUrl}/api/v1/history?${queryParams}`));
+      const response = await withRetry(() => secureFetch(`${serverUrl}/api/v1/history?${queryParams}`));
       if (response.ok) {
         // The server returns { data, meta } and serializes bigint fields as strings.
         const body = await response.json() as { data?: ServerHistoryRecord[] };

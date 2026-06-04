@@ -5,6 +5,7 @@ import {
   type Account,
 } from 'viem';
 import { AzethError } from '@azeth/common';
+import { secureFetch } from '../payments/secure-fetch.js';
 
 export interface SignedRequest {
   signature: `0x${string}`;
@@ -133,6 +134,8 @@ export function createSignedFetch(
     const headers = new Headers(init?.headers);
     headers.set('Authorization', authHeader);
 
-    return fetch(input, { ...init, headers });
+    // Route through the SDK's single network chokepoint (no guard → passthrough). `url` is the
+    // already-normalized request URL that was signed above, so this is behaviour-equivalent.
+    return secureFetch(url, { ...init, headers });
   };
 }

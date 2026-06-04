@@ -61,6 +61,8 @@ describe('account/history', () => {
       expect(result.transactions[0]?.type).toBe('transfer');
       expect(globalThis.fetch).toHaveBeenCalledWith(
         expect.stringContaining('https://api.azeth.ai/api/v1/history'),
+        // history now routes through secureFetch, which passes an (empty) init as the 2nd arg
+        expect.anything(),
       );
     });
 
