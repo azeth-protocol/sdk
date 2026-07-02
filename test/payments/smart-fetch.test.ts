@@ -85,11 +85,13 @@ describe('smartFetch402 (standalone routing layer)', () => {
     expect(result.paymentMade).toBe(true);
     expect(result.failedServices).toBeUndefined();
 
-    // Verify discovery was called with sortByReputation
+    // Verify discovery was called with sortByReputation and a WIDE fetch window (R4-3:
+    // the usable-endpoint filter runs after this fetch, so a narrow window can cut off
+    // every usable provider among blank/tunnel-endpoint registrations)
     expect(mockedDiscover).toHaveBeenCalledWith(SERVER_URL, expect.objectContaining({
       capability: 'price-feed',
       sortByReputation: true,
-      limit: 9,
+      limit: 50,
     }), expect.anything(), expect.anything());
   });
 
@@ -188,8 +190,36 @@ describe('smartFetch402 (standalone routing layer)', () => {
     );
 
     expect(mockedDiscover).toHaveBeenCalledWith(SERVER_URL, expect.objectContaining({
-      limit: 15,
+      limit: 50, // floor of 50 dominates maxRetries*3 (R4-3)
     }), expect.anything(), expect.anything());
+  });
+
+  it('fails closed when a minReputation floor cannot be verified (on-chain fallback, R4-2)', async () => {
+    const unvetted = makeService({ tokenId: 1550n, name: 'ZeroRepCatalog', reputation: 0 });
+    mockedDiscover.mockResolvedValueOnce({ entries: [unvetted], source: 'on-chain', minReputationIgnored: true });
+
+    await expect(
+      smartFetch402(
+        publicClient as any, walletClient as any, TEST_OWNER, SERVER_URL,
+        'price-feed', { minReputation: 90 },
+      ),
+    ).rejects.toThrow(/Cannot verify the minReputation=90 floor/);
+
+    // The unvetted candidate must never be paid or even fetched
+    expect(mockedFetch402).not.toHaveBeenCalled();
+  });
+
+  it('inlines per-service failure causes into the all-failed error message (R4-4)', async () => {
+    const service = makeService({ name: 'BrokeService' });
+    mockedDiscover.mockResolvedValueOnce({ entries: [service], source: 'server' });
+    mockedFetch402.mockRejectedValueOnce(new AzethError('Insufficient USDC balance: have 0, need 0.01', 'INSUFFICIENT_BALANCE'));
+
+    await expect(
+      smartFetch402(
+        publicClient as any, walletClient as any, TEST_OWNER, SERVER_URL,
+        'price-feed',
+      ),
+    ).rejects.toThrow(/BrokeService: Insufficient USDC balance/);
   });
 
   it('should pre-filter services without an endpoint', async () => {

@@ -145,11 +145,27 @@ export async function smartFetch402(
     sortByReputation: true,
     minReputation: options?.minReputation,
     entityType: options?.entityType,
-    limit: maxRetries * 3,
+    // R4-3: the usable-endpoint filter below runs AFTER this fetch, and registries carry
+    // many entries with blank/placeholder/tunnel endpoints — a small fetch window can cut
+    // off every usable provider before the filter sees it. Fetch a wide window (one cheap
+    // indexed query) and only then narrow to maxRetries attempts.
+    limit: Math.min(Math.max(maxRetries * 3, 50), 100),
   };
 
   const resolvedChain = chainName ?? chainIdToName(publicClient.chain?.id ?? 0) ?? 'baseSepolia' as SupportedChainName;
   const discoveryResult = await discoverServicesWithFallback(serverUrl, discoveryParams, publicClient, resolvedChain);
+
+  // R4-2: a reputation floor is a TRUST decision — it must fail closed. The on-chain
+  // discovery fallback cannot verify reputation (minReputationIgnored), so candidates from
+  // that path are unvetted against the caller's threshold and must not be paid.
+  if (options?.minReputation !== undefined && discoveryResult.minReputationIgnored) {
+    throw new AzethError(
+      `Cannot verify the minReputation=${options.minReputation} floor: the reputation-indexed discovery service is unavailable and on-chain fallback discovery cannot rank by reputation. Retry without minReputation, or retry later.`,
+      'SERVICE_NOT_FOUND',
+      { capability, minReputation: options.minReputation, reason: 'REPUTATION_FLOOR_UNVERIFIABLE' },
+    );
+  }
+
   const services = discoveryResult.entries
     // Reject empty AND whitespace-only endpoints — registry entries with " "
     // are truthy but produce `fetch(" ")` → "Invalid URL", aborting the fallback (S-3).
@@ -158,7 +174,9 @@ export async function smartFetch402(
 
   if (services.length === 0) {
     throw new AzethError(
-      `No services found for capability "${capability}"`,
+      options?.minReputation !== undefined
+        ? `No services with a usable endpoint meet minReputation=${options.minReputation} for capability "${capability}"`
+        : `No services found for capability "${capability}"`,
       'SERVICE_NOT_FOUND',
       { capability, minReputation: options?.minReputation },
     );
@@ -375,10 +393,20 @@ export async function smartFetch402(
   // All services failed — or, when an intent was given, it couldn't be resolved against any
   // provider's catalog. In the latter case we attach the menu (`options`) so the agent can
   // refine its intent/params and retry in ONE free round-trip instead of hitting a dead end. (F6)
+  // R4-4: the per-service causes are inlined into the MESSAGE (not only `details`, which
+  // some presentation layers drop) so "all failed" is never the whole story the agent sees.
+  const failureSummary = failedServices
+    .filter(f => !f.error.startsWith('intent unresolved') && !f.error.startsWith('catalog returned'))
+    .slice(0, 3)
+    .map(f => `${f.service.name}: ${f.error}`)
+    .join('; ');
+  const catalogMsg = hasIntent
+    ? `Could not resolve your intent for capability "${capability}". See "options" for the available catalog entries and their valid params, then retry with matching intent/params.`
+    : `Providers for capability "${capability}" serve a catalog of priced routes — pass "intent" or "params" to select one. See "options" for the catalog entries and their valid params.`;
   throw new AzethError(
     catalogOptions.length > 0
-      ? `Could not resolve your intent for capability "${capability}". See "options" for the available catalog entries and their valid params, then retry with matching intent/params.`
-      : `All ${services.length} services for capability "${capability}" failed`,
+      ? failureSummary ? `${catalogMsg} Other attempted service(s) failed — ${failureSummary}` : catalogMsg
+      : `All ${services.length} service(s) for capability "${capability}" failed — ${failureSummary}`,
     'SERVICE_NOT_FOUND',
     {
       capability,

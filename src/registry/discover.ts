@@ -243,7 +243,10 @@ async function discoverServicesWithFallbackInner(
     const entries = await discoverServices(serverUrl, params);
     // Fall back to on-chain when server returns empty results — the server index may be
     // stale or incomplete, but the on-chain registry is the source of truth.
-    if (entries.length > 0) {
+    // EXCEPTION (R4-2): when a minReputation floor was requested, an empty-but-successful
+    // server answer is AUTHORITATIVE ("no service meets the threshold") — the on-chain
+    // fallback cannot verify reputation and would reintroduce unfiltered candidates.
+    if (entries.length > 0 || params.minReputation !== undefined) {
       return { entries, source: 'server' };
     }
   } catch (err: unknown) {

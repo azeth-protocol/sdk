@@ -173,6 +173,22 @@ describe('registry/discover', () => {
       expect(result.entries).toEqual(mockEntries);
     });
 
+    it('treats an empty server result as authoritative when minReputation is set (R4-2)', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(createMockResponse(200, { data: [] }));
+      const publicClient = createMockPublicClient();
+
+      const result = await discoverServicesWithFallback(
+        serverUrl, { capability: 'data', minReputation: 90 }, publicClient, 'baseSepolia',
+      );
+
+      // "No service meets the threshold" IS the answer — the on-chain fallback cannot
+      // verify reputation and would reintroduce unvetted candidates.
+      expect(result.source).toBe('server');
+      expect(result.entries).toEqual([]);
+      expect(result.minReputationIgnored).toBeUndefined();
+      expect(publicClient.readContract).not.toHaveBeenCalled();
+    });
+
     /** Helper: build a RegistrySnapshot tuple for oracle mock responses */
     function makeSnapshot(
       tokenId: bigint,
