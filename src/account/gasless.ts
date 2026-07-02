@@ -143,6 +143,7 @@ export async function submitToRelay(
     account: body.data.account,
     tokenId: BigInt(body.data.tokenId),
     txHash: body.data.txHash,
+    creationPath: 'gasless-relay',
   };
 }
 

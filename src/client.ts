@@ -18,6 +18,7 @@ import { base, baseSepolia, sepolia as ethereumSepoliaChain, mainnet as ethereum
 import { privateKeyToAccount } from 'viem/accounts';
 import {
   AzethError,
+  AZETH_CONTRACTS,
   SUPPORTED_CHAINS,
   type SupportedChainName,
   type AzethContractAddresses,
@@ -36,7 +37,7 @@ import {
 import { validateAddress, validateUrl, validatePositiveAmount } from './utils/validation.js';
 import { resolveAddresses, requireAddress } from './utils/addresses.js';
 import { withRetry } from './utils/retry.js';
-import { AzethFactoryAbi, PaymentAgreementModuleAbi, TrustRegistryModuleAbi } from '@azeth/common/abis';
+import { AzethFactoryAbi, GuardianModuleAbi, PaymentAgreementModuleAbi, TrustRegistryModuleAbi } from '@azeth/common/abis';
 import { createAccount, getAccountAddress, type CreateAccountParams, type CreateAccountResult } from './account/create.js';
 import { createAccountGasless } from './account/gasless.js';
 import { setTokenWhitelist as setTokenWhitelistFn, setProtocolWhitelist as setProtocolWhitelistFn } from './account/guardian.js';
@@ -65,6 +66,24 @@ import { AzethEventEmitter, type AzethEventName, type AzethEventListener, type A
 import { BudgetManager, type BudgetConfig, type BudgetCheckResult } from './payments/budget.js';
 import { createAzethSmartAccountClient, type AzethSmartAccountClient } from './utils/userop.js';
 import type { PaymasterPolicy } from './utils/paymaster.js';
+import { buildL2UsdDeltaProof, type L2UsdDeltaProof } from './crosschain/proof-builder.js';
+import { proveL2UsdDelta as proveL2UsdDeltaFn, type ProveL2UsdDeltaResult } from './crosschain/prove.js';
+import {
+  getProvenNetPaidUSD as getProvenNetPaidUSDFn,
+  getAggregateNetPaidUSD as getAggregateNetPaidUSDFn,
+  getProvenDelta as getProvenDeltaFn,
+  getCrossChainReputation as getCrossChainReputationFn,
+  type ProvenDeltaResult,
+  type CrossChainReputationResult,
+} from './crosschain/read.js';
+
+/** viem Chain objects per supported chain name (shared by create() and the lazy L1/L2 clients) */
+const VIEM_CHAINS: Record<SupportedChainName, Chain> = {
+  base,
+  baseSepolia,
+  ethereumSepolia: ethereumSepoliaChain,
+  ethereum: ethereumChain,
+};
 
 export interface AzethKitConfig {
   /** The account owner's private key */
@@ -105,6 +124,18 @@ export interface AzethKitConfig {
    *  to every UserOperation, enabling operations that exceed standard spending limits.
    *  Must be explicitly set to `true` — defaults to `false` (guardian must confirm via XMTP). */
   guardianAutoSign?: boolean;
+  /** L1 chain hosting TrustL2Reader (cross-chain reputation verification).
+   *  Default: 'ethereumSepolia' when chain ∈ {baseSepolia, ethereumSepolia}, else 'ethereum'. */
+  l1Chain?: SupportedChainName;
+  /** RPC for the L1 verification chain. Default: SUPPORTED_CHAINS[l1Chain].rpcDefault. */
+  l1RpcUrl?: string;
+  /** ARCHIVE RPC for the L2 (eth_getProof at the ~7-day-old anchor block — public RPCs reject this).
+   *  Serves the kit's own chain. On a kit connected to the L1 chain (which has no L2 of its own),
+   *  an explicit value here serves the L2 named by the `chainId` passed to
+   *  buildCrossChainProof/proveCrossChainReputation — the endpoint's eth_chainId is verified
+   *  against the requested chain before any proof data is read.
+   *  Default: config.rpcUrl, then chain default; proof building will likely fail without a true archive endpoint. */
+  l2ArchiveRpcUrl?: string;
 }
 
 /** Simplified account creation — auto-fills owner, guardrails, and wraps into registry.
@@ -160,8 +191,9 @@ export interface PayResult {
   responseTimeMs?: number;
   /** Whether on-chain settlement was verified */
   settlementVerified: boolean;
-  /** How access was obtained */
-  paymentMethod: 'x402' | 'smart-account' | 'session' | 'none';
+  /** How access was obtained — see Fetch402Result.paymentMethod.
+   *  'agreement' = access granted via an active on-chain payment agreement. */
+  paymentMethod: 'x402' | 'smart-account' | 'session' | 'agreement' | 'none';
 }
 
 /** AzethKit -- Trust Infrastructure SDK for the Machine Economy
@@ -225,6 +257,29 @@ export class AzethKit {
   private readonly _guardianAutoSign: boolean;
   /** Cached SmartAccountClient instances keyed by smart account address */
   private readonly _smartAccountClients: Map<string, AzethSmartAccountClient> = new Map();
+  /** Cache of per-account self-guardian detection (guardian == owner EOA).
+   *  Guardian changes require a 24h on-chain timelock, so a per-instance cache
+   *  cannot go stale within a kit's lifetime in any practical scenario. */
+  private readonly _selfGuardianCache: Map<string, boolean> = new Map();
+
+  /** L1 chain hosting TrustL2Reader (cross-chain reputation verification) */
+  private readonly _l1ChainName: SupportedChainName;
+  /** Resolved RPC URL for the L1 verification chain */
+  private readonly _l1RpcUrl: string;
+  /** Resolved ARCHIVE RPC URL for L2 proof building (eth_getProof at the anchor block) */
+  private readonly _l2ArchiveRpcUrl: string;
+  /** Whether `config.l2ArchiveRpcUrl` was set explicitly (vs falling back to rpcUrl/chain default).
+   *  Only an explicit value may serve a chain other than the kit's own (L1-connected kits). */
+  private readonly _l2ArchiveRpcUrlExplicit: boolean;
+  /** Explicit trustL2Reader override from config.contractAddresses (applies to the L1 lookup) */
+  private readonly _trustL2ReaderOverride: `0x${string}` | undefined;
+  /** Lazily created L1 public client (TrustL2Reader reads + proof simulation) */
+  private _l1PublicClient: PublicClient<Transport, Chain> | null = null;
+  /** Lazily created L1 wallet client (plain-EOA proof broadcast — requires L1 ETH) */
+  private _l1WalletClient: WalletClient<Transport, Chain, Account> | null = null;
+  /** Lazily created L2 archive clients (proof building at the anchor block), keyed by L2 chain id —
+   *  per-chain so an explicit `chainId` never silently reads proof data from the wrong chain */
+  private readonly _l2ProofClients: Map<bigint, PublicClient<Transport, Chain>> = new Map();
 
   private constructor(
     address: `0x${string}`,
@@ -241,6 +296,11 @@ export class AzethKit {
     paymasterPolicy?: PaymasterPolicy,
     guardianKey?: `0x${string}`,
     guardianAutoSign?: boolean,
+    l1ChainName?: SupportedChainName,
+    l1RpcUrl?: string,
+    l2ArchiveRpcUrl?: string,
+    trustL2ReaderOverride?: `0x${string}`,
+    l2ArchiveRpcUrlExplicit?: boolean,
   ) {
     this.address = address;
     this.chainName = chainName;
@@ -257,6 +317,12 @@ export class AzethKit {
     this._paymasterPolicy = paymasterPolicy;
     this._guardianKey = guardianKey;
     this._guardianAutoSign = guardianAutoSign === true;
+    this._l1ChainName = l1ChainName
+      ?? (chainName === 'baseSepolia' || chainName === 'ethereumSepolia' ? 'ethereumSepolia' : 'ethereum');
+    this._l1RpcUrl = l1RpcUrl ?? SUPPORTED_CHAINS[this._l1ChainName]?.rpcDefault ?? '';
+    this._l2ArchiveRpcUrl = l2ArchiveRpcUrl ?? SUPPORTED_CHAINS[chainName]?.rpcDefault ?? '';
+    this._l2ArchiveRpcUrlExplicit = l2ArchiveRpcUrlExplicit === true;
+    this._trustL2ReaderOverride = trustL2ReaderOverride;
   }
 
   /** Create an AzethKit instance from a private key
@@ -275,13 +341,7 @@ export class AzethKit {
       );
     }
 
-    const viemChains: Record<SupportedChainName, Chain> = {
-      base,
-      baseSepolia,
-      ethereumSepolia: ethereumSepoliaChain,
-      ethereum: ethereumChain,
-    };
-    const chain = viemChains[config.chain];
+    const chain = VIEM_CHAINS[config.chain];
     const rpcUrl = config.rpcUrl ?? SUPPORTED_CHAINS[config.chain].rpcDefault;
 
     const account = privateKeyToAccount(config.privateKey);
@@ -328,6 +388,11 @@ export class AzethKit {
       config.paymasterPolicy,
       config.guardianKey,
       config.guardianAutoSign,
+      config.l1Chain,
+      config.l1RpcUrl,
+      config.l2ArchiveRpcUrl ?? config.rpcUrl,
+      config.contractAddresses?.trustL2Reader,
+      Boolean(config.l2ArchiveRpcUrl),
     );
   }
 
@@ -577,7 +642,8 @@ export class AzethKit {
     try {
       const account = fromAccount ?? await this.resolveSmartAccount();
       const smartAccountClient = await this._getSmartAccountClient(account);
-      result = await transfer(smartAccountClient, account, params, this.publicClient, this.addresses);
+      const guardianCosignAvailable = await this._guardianCosignAvailable(account);
+      result = await transfer(smartAccountClient, account, params, this.publicClient, this.addresses, guardianCosignAvailable);
     } catch (err: unknown) {
       await this.events.emit('transferError', {
         operation: 'transfer',
@@ -1422,6 +1488,136 @@ export class AzethKit {
   }
 
   // ──────────────────────────────────────────────
+  // Cross-chain reputation (TrustL2Reader, L1)
+  // ──────────────────────────────────────────────
+
+  /** Build a complete MPT storage-proof bundle for the L2 net-USD payment delta
+   *  between this account and a counterparty, against the current rollup anchor.
+   *
+   *  Read-only (L1 reads + L2 archive reads); requires an archive-capable L2 RPC
+   *  (`l2ArchiveRpcUrl`) because the anchor block is ~7 days old.
+   *
+   *  @param params.counterparty - The other side of the pair
+   *  @param params.account - Defaults to this kit's resolved smart account
+   *  @param params.chainId - L2 chain id; defaults to the kit's current chain. An explicit
+   *    id resolves its own archive client (see `l2ArchiveRpcUrl`) and the endpoint's
+   *    eth_chainId is verified against it — a mismatch throws INVALID_INPUT rather than
+   *    silently reading proof data from the wrong chain.
+   */
+  async buildCrossChainProof(params: {
+    counterparty: `0x${string}`;
+    account?: `0x${string}`;
+    chainId?: bigint;
+  }): Promise<L2UsdDeltaProof> {
+    validateAddress(params.counterparty, 'counterparty');
+    if (params.account) validateAddress(params.account, 'account');
+    const chainId = this._resolveCrossChainChainId(params.chainId);
+    const account = params.account ?? await this.resolveSmartAccount();
+
+    const l2ProofClient = this._getL2ProofClient(chainId);
+    await this._verifyL2ArchiveChainId(l2ProofClient, chainId);
+
+    return buildL2UsdDeltaProof(
+      this._getL1PublicClient(),
+      l2ProofClient,
+      this._getTrustL2ReaderAddress(),
+      { chainId, accountA: account, accountB: params.counterparty },
+    );
+  }
+
+  /** Prove this account's L2 payment relationship with a counterparty on L1.
+   *
+   *  Builds the proof (unless a pre-built `proof` is supplied) and SIMULATES it.
+   *  Only submits an L1 transaction when `broadcast: true` — a plain, permissionless
+   *  EOA transaction paid in L1 ETH by the owner key (no UserOp/guardian involvement).
+   *
+   *  @param params.broadcast - default false (simulate only)
+   *  @param params.proof - pre-built bundle from buildCrossChainProof (skips the builder)
+   */
+  async proveCrossChainReputation(params: {
+    counterparty: `0x${string}`;
+    account?: `0x${string}`;
+    chainId?: bigint;
+    broadcast?: boolean;
+    proof?: L2UsdDeltaProof;
+  }): Promise<ProveL2UsdDeltaResult> {
+    this._requireNotDestroyed();
+
+    const proof = params.proof ?? await this.buildCrossChainProof({
+      counterparty: params.counterparty,
+      account: params.account,
+      chainId: params.chainId,
+    });
+
+    const broadcast = params.broadcast === true;
+    return proveL2UsdDeltaFn(
+      this._getL1PublicClient(),
+      this._getTrustL2ReaderAddress(),
+      proof,
+      {
+        broadcast,
+        l1WalletClient: broadcast ? this._getL1WalletClient() : undefined,
+      },
+    );
+  }
+
+  /** Get the L1-proven net USD `from` has paid `to` on one L2 chain (clamped ≥ 0).
+   *  @param chainId - defaults to the kit's current L2 chain id */
+  async getCrossChainNetPaid(
+    from: `0x${string}`,
+    to: `0x${string}`,
+    chainId?: bigint,
+  ): Promise<bigint> {
+    validateAddress(from, 'from');
+    validateAddress(to, 'to');
+    const resolvedChainId = this._resolveCrossChainChainId(chainId);
+    return getProvenNetPaidUSDFn(
+      this._getL1PublicClient(), this._getTrustL2ReaderAddress(), from, to, resolvedChainId,
+    );
+  }
+
+  /** Get the L1-proven net USD `from` has paid `to` aggregated across L2 chains.
+   *  @param chainIds - defaults to all chains registered on the TrustL2Reader */
+  async getCrossChainAggregateNetPaid(
+    from: `0x${string}`,
+    to: `0x${string}`,
+    chainIds?: bigint[],
+  ): Promise<bigint> {
+    validateAddress(from, 'from');
+    validateAddress(to, 'to');
+    return getAggregateNetPaidUSDFn(
+      this._getL1PublicClient(), this._getTrustL2ReaderAddress(), from, to, chainIds,
+    );
+  }
+
+  /** Get the cached proven delta for a pair on one L2 chain (any input order).
+   *  @param chainId - defaults to the kit's current L2 chain id */
+  async getCrossChainProvenDelta(
+    accountA: `0x${string}`,
+    accountB: `0x${string}`,
+    chainId?: bigint,
+  ): Promise<ProvenDeltaResult> {
+    validateAddress(accountA, 'accountA');
+    validateAddress(accountB, 'accountB');
+    const resolvedChainId = this._resolveCrossChainChainId(chainId);
+    return getProvenDeltaFn(
+      this._getL1PublicClient(), this._getTrustL2ReaderAddress(), accountA, accountB, resolvedChainId,
+    );
+  }
+
+  /** Composite cross-chain reputation read: per-registered-chain breakdown + total. */
+  async getCrossChainReputation(
+    from: `0x${string}`,
+    to: `0x${string}`,
+  ): Promise<CrossChainReputationResult> {
+    validateAddress(from, 'from');
+    validateAddress(to, 'to');
+    return getCrossChainReputationFn(
+      this._getL1PublicClient(), this._getTrustL2ReaderAddress(), from, to,
+    );
+  }
+
+  // ──────────────────────────────────────────────
   // Messaging
   // ──────────────────────────────────────────────
 
@@ -1528,6 +1724,14 @@ export class AzethKit {
     // Note: JS strings are immutable and cannot be reliably zeroed — zeroing of
     // _privateKeyBytes is best-effort defense-in-depth, not a guarantee.
     (this as Record<string, unknown>)['walletClient'] = null;
+    // H-6 pattern (cross-chain): _l1WalletClient wraps its own privateKeyToAccount-derived
+    // signer built from the same key bytes — null it so no working signer object survives
+    // destroy(). _smartAccountClients wrap the owner signer the same way. Public clients
+    // hold no key material but are dropped for symmetry.
+    this._l1WalletClient = null;
+    this._l1PublicClient = null;
+    this._l2ProofClients.clear();
+    this._smartAccountClients.clear();
   }
 
   // ──────────────────────────────────────────────
@@ -1546,6 +1750,18 @@ export class AzethKit {
     const cached = this._smartAccountClients.get(key);
     if (cached) return cached;
 
+    // Only pass guardian key for auto-signing when explicitly enabled.
+    // When guardianAutoSign is false, operations exceeding limits will require
+    // interactive approval (XMTP) rather than being auto-signed.
+    const guardianKey = this._guardianAutoSign ? this._guardianKey : undefined;
+
+    // Self-guardian fast path: when no explicit auto-sign guardian is configured and
+    // the account's on-chain guardian IS the owner EOA, the owner signature doubles
+    // as the guardian signature. Auto-appending it unblocks guardian-tier operations
+    // (batch executions, guardrail changes, stale-oracle transfers) with zero security
+    // change — the caller already holds the only key the guardian check verifies.
+    const selfGuardianCosign = guardianKey ? false : await this._isSelfGuardianAccount(smartAccountAddress);
+
     const client = await createAzethSmartAccountClient({
       publicClient: this.publicClient,
       walletClient: this.walletClient,
@@ -1553,10 +1769,8 @@ export class AzethKit {
       bundlerUrl: this._bundlerUrl,
       paymasterUrl: this._paymasterUrl,
       paymasterPolicy: this._paymasterPolicy,
-      // Only pass guardian key for auto-signing when explicitly enabled.
-      // When guardianAutoSign is false, operations exceeding limits will require
-      // interactive approval (XMTP) rather than being auto-signed.
-      guardianKey: this._guardianAutoSign ? this._guardianKey : undefined,
+      guardianKey,
+      selfGuardianCosign,
       // Pass serverUrl so the bundler URL resolution can fall back to the
       // Azeth server's bundler proxy on testnet (zero-friction onboarding).
       serverUrl: this.serverUrl,
@@ -1564,6 +1778,176 @@ export class AzethKit {
 
     this._smartAccountClients.set(key, client);
     return client;
+  }
+
+  /** True when the account's on-chain guardian equals the owner EOA (self-guardian).
+   *  Cached per account; a failed read conservatively returns false (previous behavior). */
+  private async _isSelfGuardianAccount(smartAccountAddress: `0x${string}`): Promise<boolean> {
+    const key = smartAccountAddress.toLowerCase();
+    const cached = this._selfGuardianCache.get(key);
+    if (cached !== undefined) return cached;
+
+    let selfGuardian = false;
+    try {
+      const guardianModule = requireAddress(this.addresses, 'guardianModule');
+      const guardrails = await this.publicClient.readContract({
+        address: guardianModule,
+        abi: GuardianModuleAbi,
+        functionName: 'getGuardrails',
+        args: [smartAccountAddress],
+      }) as { guardian: `0x${string}` };
+      selfGuardian = guardrails.guardian.toLowerCase() === this.address.toLowerCase();
+    } catch {
+      // Account not initialized / read failure — fall back to owner-only signatures.
+      selfGuardian = false;
+    }
+
+    this._selfGuardianCache.set(key, selfGuardian);
+    return selfGuardian;
+  }
+
+  /** True when this kit can satisfy a guardian co-signature requirement for the
+   *  account — either an explicit auto-sign guardian key or the self-guardian
+   *  fast path. Used by pre-flight checks to decide whether guardian-tier
+   *  requirements are blocking or satisfiable. */
+  private async _guardianCosignAvailable(smartAccountAddress: `0x${string}`): Promise<boolean> {
+    if (this._guardianAutoSign && this._guardianKey) return true;
+    return this._isSelfGuardianAccount(smartAccountAddress);
+  }
+
+  /** Resolve the L2 chain id for cross-chain operations.
+   *  Defaults to the kit's current chain; requires an explicit chainId when the
+   *  kit itself is connected to the L1 verification chain. */
+  private _resolveCrossChainChainId(chainId?: bigint): bigint {
+    if (chainId !== undefined) return chainId;
+    if (this.chainName === this._l1ChainName) {
+      throw new AzethError(
+        'chainId is required when the kit is connected to the L1 chain',
+        'INVALID_INPUT',
+        { chain: this.chainName },
+      );
+    }
+    return BigInt(SUPPORTED_CHAINS[this.chainName].id);
+  }
+
+  /** Lazily create the L1 public client used for TrustL2Reader reads + proof simulation */
+  private _getL1PublicClient(): PublicClient<Transport, Chain> {
+    if (!this._l1PublicClient) {
+      this._l1PublicClient = createPublicClient({
+        chain: VIEM_CHAINS[this._l1ChainName],
+        transport: http(this._l1RpcUrl),
+      }) as PublicClient<Transport, Chain>;
+    }
+    return this._l1PublicClient;
+  }
+
+  /** Lazily create the L1 wallet client (owner EOA on the L1 chain) for proof broadcast.
+   *  Plain-EOA transactions only — must hold L1 ETH for gas. */
+  private _getL1WalletClient(): WalletClient<Transport, Chain, Account> {
+    this._requireNotDestroyed();
+    if (!this._l1WalletClient) {
+      const account = privateKeyToAccount(bytesToHex(this._privateKeyBytes) as `0x${string}`);
+      this._l1WalletClient = createWalletClient({
+        account,
+        chain: VIEM_CHAINS[this._l1ChainName],
+        transport: http(this._l1RpcUrl),
+      }) as WalletClient<Transport, Chain, Account>;
+    }
+    return this._l1WalletClient;
+  }
+
+  /** Lazily create (and cache per chain id) the L2 archive client used for proof building
+   *  at the anchor block.
+   *
+   *  RPC resolution per requested chain:
+   *  - kit's own chain → configured `_l2ArchiveRpcUrl` (explicit > rpcUrl > chain default);
+   *  - another supported chain, kit connected to the L1 with an EXPLICIT l2ArchiveRpcUrl →
+   *    that URL (the L1 kit has no L2 of its own, so the knob can only mean the target L2);
+   *  - another supported chain otherwise → that chain's own public default (the kit's
+   *    archive URL serves the kit's chain and must never be reused for a different one);
+   *  - unsupported chain id → INVALID_INPUT instead of silently querying the wrong chain.
+   *
+   *  Callers must still verify the endpoint via _verifyL2ArchiveChainId before reading
+   *  proof data. */
+  private _getL2ProofClient(chainId: bigint): PublicClient<Transport, Chain> {
+    const cached = this._l2ProofClients.get(chainId);
+    if (cached) return cached;
+
+    const chainName = (Object.keys(SUPPORTED_CHAINS) as SupportedChainName[])
+      .find((name) => BigInt(SUPPORTED_CHAINS[name].id) === chainId);
+    if (!chainName) {
+      const supported = (Object.keys(SUPPORTED_CHAINS) as SupportedChainName[])
+        .map((name) => `${name} (${SUPPORTED_CHAINS[name].id})`)
+        .join(', ');
+      throw new AzethError(
+        `No RPC mapping for L2 chain id ${chainId} — supported chains: ${supported}`,
+        'INVALID_INPUT',
+        { field: 'chainId', chainId },
+      );
+    }
+
+    let rpcUrl: string;
+    if (chainName === this.chainName) {
+      rpcUrl = this._l2ArchiveRpcUrl;
+    } else if (this._l2ArchiveRpcUrlExplicit && this.chainName === this._l1ChainName) {
+      rpcUrl = this._l2ArchiveRpcUrl;
+    } else {
+      rpcUrl = SUPPORTED_CHAINS[chainName].rpcDefault;
+    }
+
+    const client = createPublicClient({
+      chain: VIEM_CHAINS[chainName],
+      transport: http(rpcUrl),
+    }) as PublicClient<Transport, Chain>;
+    this._l2ProofClients.set(chainId, client);
+    return client;
+  }
+
+  /** Fail-closed guard: verify the L2 archive RPC actually serves the requested chain id
+   *  (eth_chainId) before any proof data is read from it. Without this, a mispointed
+   *  archive endpoint surfaces as a confusing ANCHOR_MISMATCH/NETWORK_ERROR deep inside
+   *  proof building instead of a clear configuration error. */
+  private async _verifyL2ArchiveChainId(
+    client: PublicClient<Transport, Chain>,
+    expectedChainId: bigint,
+  ): Promise<void> {
+    let actual: number;
+    try {
+      actual = await client.getChainId();
+    } catch (err) {
+      throw new AzethError(
+        `L2 archive RPC for chain ${expectedChainId} is unreachable (eth_chainId failed): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+        'NETWORK_ERROR',
+        { cause: 'rpc', chainId: expectedChainId },
+      );
+    }
+    if (BigInt(actual) !== expectedChainId) {
+      throw new AzethError(
+        `L2 archive RPC serves chain ${actual} but chainId ${expectedChainId} was requested — ` +
+          `configure l2ArchiveRpcUrl with an archive endpoint for chain ${expectedChainId}`,
+        'INVALID_INPUT',
+        { field: 'l2ArchiveRpcUrl', expectedChainId, actualChainId: BigInt(actual) },
+      );
+    }
+  }
+
+  /** Resolve the TrustL2Reader address on the L1 verification chain.
+   *  Resolution: config.contractAddresses.trustL2Reader → AZETH_CONTRACTS[l1Chain].trustL2Reader.
+   *  Never `this.addresses` (the kit's own chain record — '' on L2s). */
+  private _getTrustL2ReaderAddress(): `0x${string}` {
+    if (this._trustL2ReaderOverride && (this._trustL2ReaderOverride as string) !== '') {
+      return this._trustL2ReaderOverride;
+    }
+    const fromChain = AZETH_CONTRACTS[this._l1ChainName]?.trustL2Reader;
+    if (fromChain && (fromChain as string) !== '') {
+      return fromChain;
+    }
+    throw new AzethError(
+      'trustL2Reader address not configured',
+      'NETWORK_ERROR',
+      { field: 'trustL2Reader', chain: this._l1ChainName },
+    );
   }
 
   /** Get or create the XMTPClient instance (without initialization) */

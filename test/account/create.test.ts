@@ -25,6 +25,7 @@ vi.mock('@azeth/common', async (importOriginal) => {
         reputationModule: '0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' as `0x${string}`,
         priceOracle: '0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' as `0x${string}`,
         accountImplementation: '0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC' as `0x${string}`,
+        trustL2Reader: '' as `0x${string}`,
       },
       base: {
         factory: '' as `0x${string}`,
@@ -34,6 +35,7 @@ vi.mock('@azeth/common', async (importOriginal) => {
         reputationModule: '' as `0x${string}`,
         priceOracle: '' as `0x${string}`,
         accountImplementation: '' as `0x${string}`,
+        trustL2Reader: '' as `0x${string}`,
       },
     },
   };

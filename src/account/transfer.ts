@@ -52,6 +52,7 @@ async function preflightCheck(
   addresses: AzethContractAddresses,
   smartAccount: `0x${string}`,
   params: TransferParams,
+  guardianCosignAvailable?: boolean,
 ): Promise<void> {
   const guardianAddress = requireAddress(addresses, 'guardianModule');
 
@@ -69,6 +70,38 @@ async function preflightCheck(
   });
 
   if (reason === 0) return; // OK
+
+  // Guardian-satisfiable requirements: when the client will attach a guardian
+  // co-signature (explicit auto-sign key or self-guardian), these are not
+  // blocking — the dual signature validates at the guardian tier on-chain.
+  if (guardianCosignAvailable) {
+    if (reason === 5 || reason === 6) return; // ORACLE_STALE / GUARDIAN_REQUIRED → co-sign satisfies
+    if (reason === 2 || reason === 3) {
+      // Limits exceeded at the OWNER tier — check against the higher GUARDIAN tier.
+      const guardrails = await publicClient.readContract({
+        address: guardianAddress,
+        abi: GuardianModuleAbi,
+        functionName: 'getGuardrails',
+        args: [smartAccount],
+      }) as { guardianMaxTxAmountUSD: bigint; guardianDailySpendLimitUSD: bigint };
+      if (reason === 2 && details.usdValue <= guardrails.guardianMaxTxAmountUSD) return;
+      if (reason === 3 && details.dailySpentUSD + details.usdValue <= guardrails.guardianDailySpendLimitUSD) return;
+      // Exceeds even the guardian tier — fall through to the descriptive error below,
+      // with the guardian-tier limit in the details for an actionable message.
+      throw new AzethError(
+        reason === 2
+          ? `Transfer of ${formatUSD(details.usdValue)} exceeds even the guardian-tier per-transaction limit of ${formatUSD(guardrails.guardianMaxTxAmountUSD)}`
+          : `Transfer of ${formatUSD(details.usdValue)} would exceed even the guardian-tier daily limit of ${formatUSD(guardrails.guardianDailySpendLimitUSD)} (spent today: ${formatUSD(details.dailySpentUSD)})`,
+        'GUARDIAN_REJECTED',
+        {
+          reason: VALIDATION_REASON_NAMES[reason] ?? 'UNKNOWN',
+          usdValue: formatUSD(details.usdValue),
+          guardianMaxTxAmountUSD: formatUSD(guardrails.guardianMaxTxAmountUSD),
+          guardianDailySpendLimitUSD: formatUSD(guardrails.guardianDailySpendLimitUSD),
+        },
+      );
+    }
+  }
 
   const reasonName = VALIDATION_REASON_NAMES[reason] ?? 'UNKNOWN';
 
@@ -124,6 +157,7 @@ export async function transfer(
   params: TransferParams,
   publicClient?: PublicClient<Transport, Chain>,
   addresses?: AzethContractAddresses,
+  guardianCosignAvailable?: boolean,
 ): Promise<TransferResult> {
   // M-12 fix (Audit #8): Block negative amounts (bigint can go negative).
   // AUDIT-FIX: Also reject zero-amount transfers — they waste gas on a no-op.
@@ -134,7 +168,7 @@ export async function transfer(
   // Pre-flight guardrail check: catch spending limit / whitelist failures early
   // with descriptive errors instead of opaque "AA24 signature error".
   if (publicClient && addresses) {
-    await preflightCheck(publicClient, addresses, smartAccount, params);
+    await preflightCheck(publicClient, addresses, smartAccount, params, guardianCosignAvailable);
   }
 
   let txHash: `0x${string}`;

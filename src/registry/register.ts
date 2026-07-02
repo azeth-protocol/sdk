@@ -141,10 +141,16 @@ export interface MetadataUpdate {
   value: string;
 }
 
-/** Update multiple metadata fields in a single batch transaction.
+/** Update multiple metadata fields.
  *
- *  Encodes each key-value pair as a separate updateMetadata() call and sends them
- *  as a batch UserOp via the smart account's execute() with CALLTYPE_BATCH.
+ *  v1.3 LIMITATION — sequential, NOT atomic: the deployed GuardianModule cannot
+ *  validate CALLTYPE_BATCH UserOperations. Its calldata decoder returns the
+ *  type(uint256).max "force guardian" sentinel for batch mode, and the guardian
+ *  co-sign check then compares that same sentinel against guardianMaxTxAmountUSD —
+ *  no signature can ever satisfy it, so every batch UserOp fails AA24 (co-signed
+ *  or not). Until a future module version decodes batch items individually, each
+ *  key-value pair is sent as its own single-call UserOp in order. If update N
+ *  fails, updates 1..N-1 have already landed.
  */
 export async function updateMetadataBatch(
   publicClient: PublicClient<Transport, Chain>,
@@ -156,33 +162,24 @@ export async function updateMetadataBatch(
   if (updates.length === 0) {
     throw new AzethError('At least one metadata update is required', 'INVALID_INPUT');
   }
-  if (updates.length === 1) {
-    // Optimize: single update uses the simpler single-call path
-    return updateMetadata(publicClient, smartAccountClient, addresses, account, updates[0]!.key, updates[0]!.value);
+
+  // Sequential single-call path — see the v1.3 limitation note above. Returns the
+  // final transaction hash; on partial failure the error reports how many landed.
+  let txHash: `0x${string}` | undefined;
+  for (let i = 0; i < updates.length; i++) {
+    const { key, value } = updates[i]!;
+    try {
+      txHash = await updateMetadata(publicClient, smartAccountClient, addresses, account, key, value);
+    } catch (err: unknown) {
+      if (i > 0) {
+        throw new AzethError(
+          `Batch update failed at "${key}" (update ${i + 1} of ${updates.length}) — the first ${i} update(s) already landed on-chain. Updates are sequential on v1.3, not atomic.`,
+          'REGISTRY_ERROR',
+          { failedKey: key, applied: i, total: updates.length },
+        );
+      }
+      throw wrapContractError(err, 'REGISTRY_ERROR');
+    }
   }
-
-  const moduleAddress = requireAddress(addresses, 'trustRegistryModule');
-
-  // Encode each updateMetadata call as a separate transaction in the batch
-  const calls = updates.map(({ key, value }) => ({
-    to: moduleAddress,
-    value: 0n,
-    data: encodeFunctionData({
-      abi: TrustRegistryModuleAbi,
-      functionName: 'updateMetadata',
-      args: [key, stringToHex(value)],
-    }) as Hex,
-  }));
-
-  let txHash: `0x${string}`;
-  try {
-    txHash = await smartAccountClient.sendTransaction({
-      calls,
-    } as Parameters<typeof smartAccountClient.sendTransaction>[0]);
-  } catch (err: unknown) {
-    throw wrapContractError(err, 'REGISTRY_ERROR');
-  }
-
-  await publicClient.waitForTransactionReceipt({ hash: txHash, timeout: 120_000 });
-  return txHash;
+  return txHash!;
 }

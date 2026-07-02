@@ -45,6 +45,15 @@ export interface SmartAccountClientConfig {
    *  130-byte dual signature (owner 65 bytes + guardian 65 bytes), enabling
    *  operations that exceed standard spending limits. */
   guardianKey?: `0x${string}`;
+  /** Self-guardian fast path: when the account's on-chain guardian IS the owner EOA,
+   *  the owner signature doubles as the guardian signature (same key, same userOpHash
+   *  → byte-identical 65-byte ECDSA sig). Setting this appends a copy of the owner
+   *  signature to produce the 130-byte dual layout GuardianModule expects for
+   *  guardian-tier operations (batch executions, guardrail changes, stale-oracle
+   *  transfers) — without any separate guardian key. Adds no security and removes
+   *  none: the caller already holds the only key the guardian check verifies.
+   *  Ignored when guardianKey is set. */
+  selfGuardianCosign?: boolean;
   /** Azeth server URL. Used as bundler fallback on testnet — the server
    *  proxies bundler requests using its own PIMLICO_API_KEY so developers
    *  don't need their own key for getting started. */
@@ -70,6 +79,7 @@ export async function createAzethSmartAccount(
   smartAccountAddress: `0x${string}`,
   guardianKey?: `0x${string}`,
   estimateBundlerClient?: BundlerClient,
+  selfGuardianCosign?: boolean,
 ): Promise<SmartAccount> {
   const chainId = publicClient.chain?.id;
   if (!chainId) {
@@ -180,6 +190,13 @@ export async function createAzethSmartAccount(
         return (ownerSig + guardianSig.slice(2)) as Hex;
       }
 
+      // Self-guardian fast path: guardian == owner, so the guardian signature over the
+      // same userOpHash is byte-identical to the owner signature — duplicate it to form
+      // the 130-byte dual layout. No second signing operation, no key duplication.
+      if (selfGuardianCosign) {
+        return (ownerSig + ownerSig.slice(2)) as Hex;
+      }
+
       return ownerSig;
     },
 
@@ -195,8 +212,10 @@ export async function createAzethSmartAccount(
     // causes the bundler to underestimate verificationGasLimit (AA26).
     getStubSignature: async () => {
       const stub65 = ('0x' + '00'.repeat(31) + '01' + '00'.repeat(31) + '01' + '1b') as Hex;
-      if (guardianKey) {
-        // 130-byte stub: two valid ECDSA dummy signatures for owner + guardian
+      if (guardianKey || selfGuardianCosign) {
+        // 130-byte stub: two valid ECDSA dummy signatures for owner + guardian —
+        // estimation must exercise the same dual-signature validation path that
+        // the real signature will take (guardian tier costs more verification gas).
         return (stub65 + stub65.slice(2)) as Hex;
       }
       return stub65;
@@ -361,6 +380,7 @@ export async function createAzethSmartAccountClient(
     smartAccountAddress,
     config.guardianKey,
     estimateBundlerClient,
+    config.selfGuardianCosign,
   );
 
   // Build SmartAccountClient config with optional paymaster

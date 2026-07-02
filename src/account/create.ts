@@ -44,6 +44,11 @@ export interface CreateAccountResult {
   account: `0x${string}`;
   tokenId: bigint;
   txHash: `0x${string}`;
+  /** How the creation transaction was funded:
+   *  'gasless-relay' — the Azeth server relay sponsored gas (createAccountWithSignature);
+   *  'direct'        — the owner EOA paid gas with a direct factory transaction
+   *                    (fallback when the relay is unreachable or rate-limited). */
+  creationPath?: 'gasless-relay' | 'direct';
 }
 
 /** Deploy a new Azeth smart account via the AzethFactory v11 (one-call setup).
@@ -135,7 +140,7 @@ export async function createAccount(
     })) as `0x${string}`;
   }
 
-  return { account, tokenId, txHash };
+  return { account, tokenId, txHash, creationPath: 'direct' };
 }
 
 /** Compute the deterministic address for an account without deploying */

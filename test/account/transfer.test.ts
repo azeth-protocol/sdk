@@ -253,4 +253,141 @@ describe('account/transfer', () => {
       }
     });
   });
+
+  describe('guardian-co-sign-aware pre-flight (self-guardian / auto-sign)', () => {
+    let publicClient: ReturnType<typeof createMockPublicClient>;
+
+    function mockCheckResult(reason: number, overrides: Partial<{
+      usdValue: bigint; dailySpentUSD: bigint; maxTxAmountUSD: bigint;
+      dailySpendLimitUSD: bigint;
+    }> = {}) {
+      return [
+        reason,
+        {
+          usdValue: overrides.usdValue ?? 1000_000000_000000_000000n,
+          dailySpentUSD: overrides.dailySpentUSD ?? 0n,
+          maxTxAmountUSD: overrides.maxTxAmountUSD ?? 2000_000000_000000_000000n,
+          dailySpendLimitUSD: overrides.dailySpendLimitUSD ?? 10000_000000_000000_000000n,
+          targetWhitelisted: true,
+          oracleStale: false,
+        },
+      ];
+    }
+
+    const GUARDRAILS = {
+      maxTxAmountUSD: 2000_000000_000000_000000n,
+      dailySpendLimitUSD: 10000_000000_000000_000000n,
+      guardianMaxTxAmountUSD: 10000_000000_000000_000000n,
+      guardianDailySpendLimitUSD: 50000_000000_000000_000000n,
+      guardian: '0x1111111111111111111111111111111111111111',
+      emergencyWithdrawTo: '0x1111111111111111111111111111111111111111',
+    };
+
+    beforeEach(() => {
+      publicClient = createMockPublicClient();
+    });
+
+    it('proceeds through ORACLE_STALE (reason 5) when guardian co-sign is available', async () => {
+      publicClient.readContract.mockResolvedValue(mockCheckResult(5));
+
+      const result = await transfer(
+        smartAccountClient, TEST_SMART_ACCOUNT,
+        { to: TEST_RECIPIENT, token: TEST_TOKEN, amount: 1000000n },
+        publicClient as never, TEST_ADDRESSES,
+        true, // guardianCosignAvailable
+      );
+
+      expect(result.txHash).toBe(TEST_TX_HASH);
+      expect(smartAccountClient.sendTransaction).toHaveBeenCalled();
+    });
+
+    it('proceeds through GUARDIAN_REQUIRED (reason 6) when guardian co-sign is available', async () => {
+      publicClient.readContract.mockResolvedValue(mockCheckResult(6));
+
+      const result = await transfer(
+        smartAccountClient, TEST_SMART_ACCOUNT,
+        { to: TEST_RECIPIENT, amount: 1000000000000000000n },
+        publicClient as never, TEST_ADDRESSES,
+        true,
+      );
+
+      expect(result.txHash).toBe(TEST_TX_HASH);
+    });
+
+    it('still throws on ORACLE_STALE when co-sign is NOT available (regression)', async () => {
+      publicClient.readContract.mockResolvedValue(mockCheckResult(5));
+
+      await expect(
+        transfer(
+          smartAccountClient, TEST_SMART_ACCOUNT,
+          { to: TEST_RECIPIENT, amount: 1000000000000000000n },
+          publicClient as never, TEST_ADDRESSES,
+          false,
+        ),
+      ).rejects.toThrow(/oracle.*stale/i);
+    });
+
+    it('escalates EXCEEDS_TX_LIMIT (reason 2) to the guardian tier and proceeds when within it', async () => {
+      publicClient.readContract.mockImplementation(async (args: { functionName?: string }) => {
+        if (args.functionName === 'checkOperation') {
+          return mockCheckResult(2, { usdValue: 5000_000000_000000_000000n });
+        }
+        if (args.functionName === 'getGuardrails') return GUARDRAILS;
+        return 0n;
+      });
+
+      const result = await transfer(
+        smartAccountClient, TEST_SMART_ACCOUNT,
+        { to: TEST_RECIPIENT, amount: 3000000000000000000n },
+        publicClient as never, TEST_ADDRESSES,
+        true,
+      );
+
+      expect(result.txHash).toBe(TEST_TX_HASH);
+      expect(publicClient.readContract).toHaveBeenCalledWith(
+        expect.objectContaining({ functionName: 'getGuardrails' }),
+      );
+    });
+
+    it('throws a guardian-tier error when the amount exceeds even the guardian limit', async () => {
+      publicClient.readContract.mockImplementation(async (args: { functionName?: string }) => {
+        if (args.functionName === 'checkOperation') {
+          return mockCheckResult(2, { usdValue: 20000_000000_000000_000000n });
+        }
+        if (args.functionName === 'getGuardrails') return GUARDRAILS;
+        return 0n;
+      });
+
+      await expect(
+        transfer(
+          smartAccountClient, TEST_SMART_ACCOUNT,
+          { to: TEST_RECIPIENT, amount: 12000000000000000000n },
+          publicClient as never, TEST_ADDRESSES,
+          true,
+        ),
+      ).rejects.toThrow(/guardian-tier per-transaction limit/);
+    });
+
+    it('escalates EXCEEDS_DAILY_LIMIT (reason 3) to the guardian daily tier', async () => {
+      publicClient.readContract.mockImplementation(async (args: { functionName?: string }) => {
+        if (args.functionName === 'checkOperation') {
+          return mockCheckResult(3, {
+            usdValue: 2000_000000_000000_000000n,
+            dailySpentUSD: 9000_000000_000000_000000n,
+          });
+        }
+        if (args.functionName === 'getGuardrails') return GUARDRAILS;
+        return 0n;
+      });
+
+      const result = await transfer(
+        smartAccountClient, TEST_SMART_ACCOUNT,
+        { to: TEST_RECIPIENT, amount: 1000000000000000000n },
+        publicClient as never, TEST_ADDRESSES,
+        true,
+      );
+
+      expect(result.txHash).toBe(TEST_TX_HASH);
+    });
+  });
 });

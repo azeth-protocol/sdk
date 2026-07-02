@@ -25,6 +25,7 @@ export function resolveAddresses(
     validateOverride(overrides.reputationModule, 'reputationModule');
     validateOverride(overrides.priceOracle, 'priceOracle');
     validateOverride(overrides.accountImplementation, 'accountImplementation');
+    validateOverride(overrides.trustL2Reader, 'trustL2Reader');
   }
 
   const defaults = AZETH_CONTRACTS[chainName];
@@ -36,6 +37,8 @@ export function resolveAddresses(
     reputationModule: overrides?.reputationModule ?? defaults.reputationModule,
     priceOracle: overrides?.priceOracle ?? defaults.priceOracle,
     accountImplementation: overrides?.accountImplementation ?? defaults.accountImplementation,
+    // trustL2Reader is L1-only and optional (like priceOracle) — NOT in REQUIRED_FIELDS
+    trustL2Reader: overrides?.trustL2Reader ?? defaults.trustL2Reader,
   };
 
   // HIGH-8 fix: Validate that no required address is empty. Empty addresses (like Base

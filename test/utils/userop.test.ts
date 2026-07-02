@@ -319,3 +319,66 @@ describe('applyVerificationGasBuffer', () => {
     }
   });
 });
+
+describe('self-guardian auto co-sign (signUserOperation / getStubSignature)', () => {
+  const OWNER_SIG = ('0x' + 'ab'.repeat(65)) as `0x${string}`;
+
+  function walletClientWithSig(): WalletClient<Transport, Chain, Account> {
+    return {
+      signMessage: vi.fn().mockResolvedValue(OWNER_SIG),
+      signTypedData: vi.fn().mockResolvedValue('0xmocktypedsig'),
+      account: { address: '0x1111111111111111111111111111111111111111' },
+      chain: { id: 84532 },
+    } as unknown as WalletClient<Transport, Chain, Account>;
+  }
+
+  /** Create the client and return the captured toSmartAccount implementation config. */
+  async function accountImplFor(opts: { guardianKey?: `0x${string}`; selfGuardianCosign?: boolean }) {
+    await createAzethSmartAccountClient({
+      publicClient: mockPublicClient(),
+      walletClient: walletClientWithSig(),
+      smartAccountAddress: TEST_SMART_ACCOUNT,
+      bundlerUrl: TEST_BUNDLER_URL,
+      ...opts,
+    });
+    const call = mockToSmartAccount.mock.calls.at(-1)!;
+    return call[0] as {
+      signUserOperation: (op: Record<string, unknown>) => Promise<string>;
+      getStubSignature: () => Promise<string>;
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('duplicates the owner signature into a 130-byte dual sig when selfGuardianCosign is set', async () => {
+    const impl = await accountImplFor({ selfGuardianCosign: true });
+    const sig = await impl.signUserOperation({});
+    // guardian == owner ⇒ guardian sig over the same userOpHash is byte-identical
+    expect(sig).toBe(OWNER_SIG + OWNER_SIG.slice(2));
+    expect(sig.length).toBe(2 + 130 * 2);
+  });
+
+  it('returns a 130-byte stub when selfGuardianCosign is set (estimation exercises the dual path)', async () => {
+    const impl = await accountImplFor({ selfGuardianCosign: true });
+    const stub = await impl.getStubSignature();
+    expect(stub.length).toBe(2 + 130 * 2);
+  });
+
+  it('keeps the owner-only 65-byte signature and stub by default (regression)', async () => {
+    const impl = await accountImplFor({});
+    expect(await impl.signUserOperation({})).toBe(OWNER_SIG);
+    expect((await impl.getStubSignature()).length).toBe(2 + 65 * 2);
+  });
+
+  it('an explicit guardianKey takes precedence over selfGuardianCosign (distinct guardian sig)', async () => {
+    const guardianKey = ('0x' + '22'.repeat(32)) as `0x${string}`;
+    const impl = await accountImplFor({ guardianKey, selfGuardianCosign: true });
+    const sig = await impl.signUserOperation({});
+    expect(sig.startsWith(OWNER_SIG)).toBe(true);
+    expect(sig.length).toBe(2 + 130 * 2);
+    // The guardian sig comes from the distinct guardian key, NOT a copy of the owner sig
+    expect(sig).not.toBe(OWNER_SIG + OWNER_SIG.slice(2));
+  });
+});

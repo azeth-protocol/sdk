@@ -145,9 +145,12 @@ export interface Fetch402Result {
   /** How access was obtained.
    *  - 'x402': Standard x402 payment flow (ERC-3009 authorization signed and submitted)
    *  - 'smart-account': Payment via smart account UserOp (guardian guardrails enforced)
-   *  - 'session': Access granted via SIWx identity (prior payment session or agreement)
+   *  - 'session': Access granted via SIWx identity (prior payment session)
+   *  - 'agreement': Access granted via an active on-chain payment agreement
+   *    (server-discriminated via the X-Access-Grant response header; providers that
+   *    do not emit the header report 'session' — exact pre-F4 behavior)
    *  - 'none': No payment was required (non-402 response) */
-  paymentMethod: 'x402' | 'smart-account' | 'session' | 'none';
+  paymentMethod: 'x402' | 'smart-account' | 'session' | 'agreement' | 'none';
 }
 
 /** Fetch a URL, automatically paying x402 requirements
@@ -263,6 +266,19 @@ export async function fetch402(
   // Before paying, check if the server supports SIWx and we have a smart account.
   // If the server recognizes our wallet (via agreement or prior payment session),
   // access is granted without payment.
+  //
+  // N5 (repeat-call double-settle prevention) lives SERVER-side, not here: providers
+  // record the verified on-chain payer of every settlement — including pre-settled
+  // smart-account payments (preSettledPaymentMiddleware → recordPayment) — into their
+  // SIWx storage keyed by resource path, and this fresh SIWx attempt runs on EVERY
+  // call. A repeat call therefore re-presents the same smart-account identity and is
+  // granted access with no new settlement, with zero client-side state — per-call
+  // client lifecycles (MCP) are covered because the record lives in the long-lived
+  // provider process. Against a provider deployed before payer-recording, the SIWx
+  // retry is denied and the client pays again (exact legacy behavior until that
+  // provider is redeployed). A client-side grant cache was tried and removed: it can
+  // never gate this flow (the server is authoritative and the attempt is already
+  // unconditional), so it was behaviorally inert.
   const extensions = (requirement as unknown as Record<string, unknown>).extensions as
     Record<string, SIWxExtension> | undefined;
   const siwxExt = extensions?.['sign-in-with-x'];
@@ -271,8 +287,10 @@ export async function fetch402(
     const siwxResult = await attemptSIWx(
       walletClient, options.smartAccount, url, method, options, siwxExt, fetchTimeout,
     );
-    if (siwxResult) return siwxResult;
-    // SIWx didn't grant access — fall through to ERC-3009 payment
+    if (siwxResult) {
+      return siwxResult;
+    }
+    // SIWx didn't grant access — fall through to payment.
   }
 
   // ── Smart account payment path ────────────────────────────────────
@@ -287,7 +305,14 @@ export async function fetch402(
     const saResult = await attemptSmartAccountPayment(
       publicClient, walletClient, account, url, method, options, requirement, v2Accept, fetchTimeout,
     );
-    if (saResult) return saResult;
+    if (saResult) {
+      // N5: the payer recorded on-chain is the smartAccount — exactly the identity SIWx
+      // presents — and providers record pre-settled payers into their SIWx storage, so a
+      // later call's SIWx attempt is granted instead of re-settling. (On the EOA path
+      // below, the facilitator records the EOA while SIWx presents the smartAccount, so
+      // repeat EOA calls pay again — by design.)
+      return saResult;
+    }
     // attemptSmartAccountPayment returned null without throwing — this means a
     // non-critical validation issue (e.g., missing EIP-712 domain params in the
     // 402 response). Throw rather than silently falling back to EOA.
@@ -589,6 +614,12 @@ export async function fetch402(
   };
 }
 
+/** Response header the provider emits when access was granted WITHOUT fresh settlement (F4).
+ *  Values: 'session' (prior payment record) | 'agreement' (active on-chain agreement).
+ *  Old providers don't emit it — absent or unknown values map to 'session' for exact
+ *  backward-compatible behavior. */
+const ACCESS_GRANT_HEADER = 'X-Access-Grant';
+
 /** Attempt SIWx identity proof to get access without payment.
  *
  *  Creates a SIWE message signed by the EOA but with the smart account as the address,
@@ -646,13 +677,18 @@ async function attemptSIWx(
       guardedRedirect: 'error',
     });
 
-    // If NOT 402, SIWx succeeded — access granted without payment
+    // If NOT 402, SIWx succeeded — access granted without payment.
+    // The provider discriminates HOW via the X-Access-Grant response header (F4):
+    // 'agreement' = active on-chain payment agreement; 'session' = prior payment
+    // session. Header absent (old providers) or unknown value → 'session', which is
+    // the exact pre-F4 behavior. Headers.get() is case-insensitive per the fetch spec.
     if (siwxResponse.status !== 402) {
+      const grantKind = siwxResponse.headers.get(ACCESS_GRANT_HEADER);
       return {
         response: siwxResponse,
         paymentMade: false,
         settlementVerified: false,
-        paymentMethod: 'session',
+        paymentMethod: grantKind === 'agreement' ? 'agreement' : 'session',
       };
     }
 

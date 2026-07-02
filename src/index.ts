@@ -119,6 +119,43 @@ export {
   type ErrorEventData,
 } from './events/emitter.js';
 
+// Cross-chain reputation (TrustL2Reader)
+export {
+  canonicalizePair,
+  computeTransferDeltaUSDSlot,
+  decodeInt256Word,
+  L2_TO_L1_MESSAGE_PASSER,
+  OUTPUT_ROOT_VERSION_V0,
+  type CanonicalPair,
+} from './crosschain/slots.js';
+export {
+  ANCHOR_STATE_REGISTRY_ABI,
+  buildL2UsdDeltaProof,
+  getAnchorState,
+  type AnchorState,
+  type OutputRootPreimage,
+  type L2UsdDeltaProof,
+  type BuildL2UsdDeltaProofParams,
+} from './crosschain/proof-builder.js';
+export {
+  proveL2UsdDelta,
+  type ProveL2UsdDeltaOptions,
+  type ProveL2UsdDeltaResult,
+  type ProveStatus,
+} from './crosschain/prove.js';
+export {
+  getProvenNetPaidUSD,
+  getAggregateNetPaidUSD,
+  getProvenDelta,
+  getRegisteredChainIds,
+  getL2ChainConfig,
+  getCrossChainReputation,
+  type ProvenDeltaResult,
+  type L2ChainConfigResult,
+  type ChainNetPaidBreakdown,
+  type CrossChainReputationResult,
+} from './crosschain/read.js';
+
 // ERC-4337 UserOp execution (smart account client)
 export { createAzethSmartAccountClient, createAzethSmartAccount, type AzethSmartAccountClient } from './utils/userop.js';
 

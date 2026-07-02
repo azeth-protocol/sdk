@@ -463,6 +463,125 @@ describe('payments/x402', () => {
       const siwxHeader = headers.get('SIGN-IN-WITH-X');
       expect(siwxHeader).toBe('base64-encoded-siwx-header');
     });
+
+    describe('X-Access-Grant discrimination (F4) + repeat-call flow (N5)', () => {
+      /** First call → 402 with the SIWx requirement; second call (SIWx retry) → 200 grant. */
+      function setupSiwxGrant(grantHeaders?: Record<string, string>) {
+        const calls: number[] = [];
+        globalThis.fetch = vi.fn().mockImplementation(() => {
+          calls.push(1);
+          if (calls.length === 1) {
+            return Promise.resolve(
+              createMockResponse(402, null, { 'X-Payment-Required': JSON.stringify(siwxPaymentRequirement) }),
+            );
+          }
+          return Promise.resolve(createMockResponse(200, { data: 'granted' }, grantHeaders));
+        });
+      }
+
+      /** 402 → SIWx retry rejected (402) → payment retry 200. */
+      function setupSiwxRejectedThenPaid() {
+        const calls: number[] = [];
+        globalThis.fetch = vi.fn().mockImplementation(() => {
+          calls.push(1);
+          if (calls.length <= 2) {
+            return Promise.resolve(
+              createMockResponse(402, null, { 'X-Payment-Required': JSON.stringify(siwxPaymentRequirement) }),
+            );
+          }
+          return Promise.resolve(createMockResponse(200, { data: 'paid content' }));
+        });
+      }
+
+      it("[REGRESSION F4] reports paymentMethod 'agreement' when grant response carries X-Access-Grant: agreement", async () => {
+        setupSiwxGrant({ 'X-Access-Grant': 'agreement' });
+
+        const result = await fetch402(publicClient, walletClient, TEST_ACCOUNT, testUrl, {
+          smartAccount: TEST_SMART_ACCOUNT,
+        });
+
+        expect(result.paymentMade).toBe(false);
+        expect(result.paymentMethod).toBe('agreement');
+        expect(result.response.status).toBe(200);
+        expect(result.settlementVerified).toBe(false);
+        expect(walletClient.signTypedData).not.toHaveBeenCalled();
+      });
+
+      it("[BACKWARD-COMPAT 1] header absent → paymentMethod 'session' and flow identical to today (old provider)", async () => {
+        // Old deployed provider (api.azeth.ai until redeploy): grants access but emits no header
+        setupSiwxGrant();
+
+        const result = await fetch402(publicClient, walletClient, TEST_ACCOUNT, testUrl, {
+          smartAccount: TEST_SMART_ACCOUNT,
+        });
+
+        expect(result.paymentMethod).toBe('session');
+        expect(result.paymentMade).toBe(false);
+        expect(result.settlementVerified).toBe(false);
+        expect(result.response.status).toBe(200);
+        // Exactly the pre-F4 flow: initial 402 + SIWx retry, no payment request, no ERC-3009 signature
+        expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+        expect(walletClient.signTypedData).not.toHaveBeenCalled();
+      });
+
+      it("maps an explicit 'session' value and unknown header values to 'session'", async () => {
+        setupSiwxGrant({ 'X-Access-Grant': 'session' });
+        const explicit = await fetch402(publicClient, walletClient, TEST_ACCOUNT, testUrl, {
+          smartAccount: TEST_SMART_ACCOUNT,
+        });
+        expect(explicit.paymentMethod).toBe('session');
+
+        setupSiwxGrant({ 'X-Access-Grant': 'mystery-future-kind' });
+        const unknown = await fetch402(publicClient, walletClient, TEST_ACCOUNT, testUrl, {
+          smartAccount: TEST_SMART_ACCOUNT,
+        });
+        expect(unknown.paymentMethod).toBe('session');
+      });
+
+      it('[REGRESSION N5] repeat call needs NO client-side state: fresh SIWx is re-presented and granted without re-settling', async () => {
+        // The double-settle prevention is SERVER-side: providers record the verified
+        // on-chain payer (pre-settled.ts recordPayment / the x402 settle hook) keyed by
+        // resource path, and fetch402 attempts a fresh SIWx sign-in on EVERY call.
+        //
+        // Call 1: server doesn't recognize the smart account yet — SIWx rejected → pays
+        // via the smart account (the on-chain payer IS the SIWx identity).
+        setupSiwxRejectedThenPaid();
+        const mockSmartAccountTransfer = vi.fn().mockResolvedValue(
+          '0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890' as `0x${string}`,
+        );
+        const first = await fetch402(publicClient, walletClient, TEST_ACCOUNT, testUrl, {
+          smartAccount: TEST_SMART_ACCOUNT,
+          smartAccountTransfer: mockSmartAccountTransfer,
+        });
+        expect(first.paymentMade).toBe(true);
+        expect(first.paymentMethod).toBe('smart-account');
+        expect(mockSmartAccountTransfer).toHaveBeenCalledOnce();
+
+        // Call 2 — a brand-new invocation with zero shared client state (exactly the MCP
+        // per-call client lifecycle): the provider recorded the payer, so the unconditional
+        // SIWx retry is granted — no settlement, no second charge.
+        setupSiwxGrant({ 'X-Access-Grant': 'session' });
+        const second = await fetch402(publicClient, walletClient, TEST_ACCOUNT, testUrl, {
+          smartAccount: TEST_SMART_ACCOUNT,
+          smartAccountTransfer: mockSmartAccountTransfer,
+        });
+        expect(second.paymentMade).toBe(false);
+        expect(second.paymentMethod).toBe('session');
+        expect(mockSmartAccountTransfer).toHaveBeenCalledOnce(); // still once — no re-settle
+      });
+
+      it('[BACKWARD-COMPAT N5] old provider (no payer recording): SIWx denied → client pays again, exactly legacy behavior', async () => {
+        // Until api.azeth.ai redeploys with recordPayment wiring, the SIWx retry after a
+        // prior payment is denied and the client settles again. That is the pre-fix
+        // behavior by design — N5 closes operationally on provider redeploy.
+        setupSiwxRejectedThenPaid();
+        const result = await fetch402(publicClient, walletClient, TEST_ACCOUNT, testUrl, {
+          smartAccount: TEST_SMART_ACCOUNT,
+        });
+        expect(result.paymentMade).toBe(true);
+        expect(result.paymentMethod).toBe('x402');
+      });
+    });
   });
 
   describe('smart account payment flow', () => {
